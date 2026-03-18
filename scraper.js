@@ -1,12 +1,13 @@
 /**
- * Brokers MKTLab - Lead Exporter v2
+ * Brokers MKTLab - Lead Exporter v3
  * 
- * Fixes:
- * - Workspace selection ("V4 Company Ferraz Piai & Co")
- * - Robust login detection with multiple selector strategies
- * - Fallback: scrape table DOM if CSV export fails
- * - Built-in 1-hour cron loop
- * - Debug screenshots at every step
+ * Login flow (3 steps, 2 domains):
+ *   1. brokers.mktlab.app/signin → Click "Acessar Lead Brokers"
+ *   2. identity.mktlab.app → Fill email → Click "Avançar"
+ *   3. identity.mktlab.app → Fill password → Click "Entrar"
+ *   4. Redirected to brokers.mktlab.app (wrong workspace) 
+ *   5. Navigate directly to correct workspace URL
+ *   6. Click "Meus Leads" → Export CSV or scrape table
  * 
  * Desenvolvido por V4 Ferraz Piai & Co.
  */
@@ -26,8 +27,9 @@ const CONFIG = {
   timeout: parseInt(process.env.TIMEOUT_MS) || 60000,
   retryAttempts: parseInt(process.env.RETRY_ATTEMPTS) || 3,
   retryDelayMs: parseInt(process.env.RETRY_DELAY_MS) || 5000,
-  cronIntervalMs: parseInt(process.env.CRON_INTERVAL_MS) || 3600000, // 1 hora
-  workspaceName: process.env.WORKSPACE_NAME || "V4 Company Ferraz Piai",
+  cronIntervalMs: parseInt(process.env.CRON_INTERVAL_MS) || 3600000,
+  // URL direta do workspace correto (com & literal, não %26)
+  workspaceUrl: process.env.WORKSPACE_URL || "https://brokers.mktlab.app/v4-company-ferraz-piai-&-co.",
   debug: process.env.DEBUG === "true",
 };
 
@@ -39,586 +41,414 @@ const log = {
   error: (msg) => console.error(`[${ts()}] ❌ ${msg}`),
   debug: (msg) => { if (CONFIG.debug) console.log(`[${ts()}] 🐛 ${msg}`); },
 };
-
 function ts() { return new Date().toISOString(); }
 function getTimestamp() { return new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19); }
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
-// ─── Debug Screenshot Helper ──────────────────────────────────────────────────
-async function debugScreenshot(page, stepName) {
+async function screenshot(page, name) {
+  if (!CONFIG.debug) return;
   try {
     fs.mkdirSync(CONFIG.outputDir, { recursive: true });
-    const filePath = path.join(CONFIG.outputDir, `debug_${stepName}_${getTimestamp()}.png`);
-    await page.screenshot({ path: filePath, fullPage: true });
-    log.debug(`Screenshot: ${filePath}`);
+    const p = path.join(CONFIG.outputDir, `debug_${name}_${getTimestamp()}.png`);
+    await page.screenshot({ path: p, fullPage: true });
+    log.debug(`Screenshot: ${p}`);
   } catch (_) {}
 }
 
-// ─── Step 1: Login ────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// STEP 1: Login completo (3 etapas)
+// ═══════════════════════════════════════════════════════════════════════════════
 async function doLogin(page) {
-  log.info("Acessando plataforma...");
-  await page.goto(CONFIG.baseUrl, { waitUntil: "networkidle", timeout: CONFIG.timeout });
+  // ── Etapa 1: Acessar brokers.mktlab.app → clicar "Acessar Lead Brokers" ──
+  log.info("Etapa 1/3: Acessando brokers.mktlab.app/signin...");
+  await page.goto(`${CONFIG.baseUrl}/signin`, { waitUntil: "networkidle", timeout: CONFIG.timeout });
   await page.waitForTimeout(3000);
+  await screenshot(page, "01_signin_page");
 
-  await debugScreenshot(page, "01_initial_page");
-
-  // Detectar login com múltiplos seletores
-  const loginSelectors = [
-    'input[type="email"]',
-    'input[name="email"]',
-    'input[placeholder*="mail"]',
-    'input[placeholder*="Mail"]',
-    'input[placeholder*="E-mail"]',
-    'input[placeholder*="usuário"]',
-    'input[placeholder*="usuario"]',
-    'input[placeholder*="login"]',
-    'input[autocomplete="email"]',
-    'input[autocomplete="username"]',
-  ];
-
-  let emailInput = null;
-  for (const selector of loginSelectors) {
-    try {
-      const el = page.locator(selector).first();
-      if (await el.isVisible({ timeout: 2000 })) {
-        emailInput = el;
-        log.info(`Campo de email encontrado: ${selector}`);
-        break;
-      }
-    } catch (_) {}
+  // Verifica se já está logado (se não caiu no /signin)
+  const currentUrl = page.url();
+  if (!currentUrl.includes("signin") && !currentUrl.includes("identity")) {
+    log.info("Parece já estar autenticado (não redirecionou para signin).");
+    return;
   }
 
-  if (!emailInput) {
-    // Tenta achar qualquer input visível que pareça ser email
-    const allInputs = page.locator('input:visible');
-    const count = await allInputs.count();
-    log.debug(`Inputs visíveis na página: ${count}`);
-    
-    if (count >= 2) {
-      // Assume: primeiro input = email, segundo = senha
-      emailInput = allInputs.nth(0);
-      log.info("Usando primeiro input visível como campo de email.");
-    }
-  }
-
-  if (emailInput) {
-    log.info("Realizando login...");
-    await emailInput.fill(CONFIG.email);
-    await page.waitForTimeout(500);
-
-    // Busca campo de senha
-    const passwordSelectors = [
-      'input[type="password"]',
-      'input[name="password"]',
-      'input[placeholder*="enha"]',
-      'input[placeholder*="assword"]',
-      'input[autocomplete="current-password"]',
-    ];
-
-    let passwordInput = null;
-    for (const selector of passwordSelectors) {
-      try {
-        const el = page.locator(selector).first();
-        if (await el.isVisible({ timeout: 2000 })) {
-          passwordInput = el;
-          break;
-        }
-      } catch (_) {}
-    }
-
-    if (!passwordInput) {
-      // Fallback: segundo input visível
-      const allInputs = page.locator('input:visible');
-      if (await allInputs.count() >= 2) {
-        passwordInput = allInputs.nth(1);
-      }
-    }
-
-    if (passwordInput) {
-      await passwordInput.fill(CONFIG.password);
-      await page.waitForTimeout(500);
-    }
-
-    await debugScreenshot(page, "02_login_filled");
-
-    // Busca botão de submit
-    const submitSelectors = [
-      'button[type="submit"]',
-      'button:has-text("Entrar")',
-      'button:has-text("Login")',
-      'button:has-text("Acessar")',
-      'button:has-text("Enviar")',
-      'input[type="submit"]',
-      'button:visible >> nth=0',
-    ];
-
-    for (const selector of submitSelectors) {
-      try {
-        const btn = page.locator(selector).first();
-        if (await btn.isVisible({ timeout: 2000 })) {
-          await btn.click();
-          log.info(`Login submetido via: ${selector}`);
-          break;
-        }
-      } catch (_) {}
-    }
-
-    // Espera navegação pós-login
-    await page.waitForLoadState("networkidle", { timeout: CONFIG.timeout }).catch(() => {});
-    await page.waitForTimeout(3000);
-    log.success("Login realizado.");
+  // Clicar no botão vermelho "Acessar Lead Brokers"
+  const accessButton = page.locator('a:has-text("Acessar Lead Brokers"), button:has-text("Acessar Lead Brokers")').first();
+  if (await accessButton.isVisible({ timeout: 5000 }).catch(() => false)) {
+    log.info("Clicando em 'Acessar Lead Brokers'...");
+    await accessButton.click();
   } else {
-    log.info("Nenhum campo de login encontrado — possivelmente já autenticado.");
+    // Talvez já esteja na página de login do identity
+    log.info("Botão 'Acessar Lead Brokers' não encontrado — pode já estar no identity.");
   }
 
-  await debugScreenshot(page, "03_after_login");
-}
+  // Espera redirecionar para identity.mktlab.app
+  await page.waitForLoadState("networkidle", { timeout: CONFIG.timeout }).catch(() => {});
+  await page.waitForTimeout(3000);
+  await screenshot(page, "02_identity_page");
 
-// ─── Step 2: Selecionar Workspace ─────────────────────────────────────────────
-async function selectWorkspace(page) {
-  log.info(`Selecionando workspace: "${CONFIG.workspaceName}"...`);
-  await page.waitForTimeout(2000);
-
-  // O dropdown do workspace fica no canto superior esquerdo
-  // Baseado nas screenshots: é um seletor com o nome da empresa atual
+  // ── Etapa 2: Preencher email → clicar "Avançar" ──────────────────────────
+  log.info("Etapa 2/3: Preenchendo email...");
   
-  // Estratégia 1: Clicar no seletor de workspace (o componente com ícone de seta)
-  const workspaceSelectors = [
-    // O elemento parece ser um botão/div com o nome do workspace e um ícone de dropdown
-    '[class*="workspace"] [class*="select"]',
-    '[class*="company"] [class*="select"]',
-    'button:has-text("v4company")',
-    'div:has-text("v4company") >> nth=0',
-    // Seletor genérico para o dropdown no sidebar
-    'nav button:has([class*="chevron"])',
-    'aside button:has([class*="chevron"])',
-    // Tentar pelo texto visível
-    ':text("v4company com") >> xpath=./ancestor::button | ./ancestor::div[@role="button"]',
-  ];
-
-  let dropdownOpened = false;
-
-  // Primeiro tenta: clicar em qualquer elemento que contenha o texto do workspace atual
-  // e que pareça ser um seletor/dropdown
+  // Espera o campo de email aparecer
+  const emailInput = page.locator('input[type="email"], input[name="email"], input[placeholder*="mail"], input[autocomplete="email"]').first();
   try {
-    // Procura o componente de seleção de workspace no sidebar
-    // Baseado no screenshot: aparece como "V v4company com" com uma setinha
-    const sidebarSelector = page.locator('aside, nav, [class*="sidebar"]').first();
-    
-    // Tenta encontrar um botão ou div clicável que contenha texto de workspace
-    const clickables = page.locator('button, [role="button"], [class*="select"], [class*="dropdown"]');
-    const count = await clickables.count();
-    
-    for (let i = 0; i < count; i++) {
-      const el = clickables.nth(i);
-      try {
-        const text = await el.textContent({ timeout: 1000 });
-        if (text && (text.includes("v4company") || text.includes("V4 Company") || text.includes("Ferraz"))) {
-          log.debug(`Encontrei seletor de workspace: "${text.trim().substring(0, 50)}"`);
-          await el.click();
-          dropdownOpened = true;
-          await page.waitForTimeout(1500);
-          break;
-        }
-      } catch (_) {}
-    }
+    await emailInput.waitFor({ state: "visible", timeout: 10000 });
+    await emailInput.fill(CONFIG.email);
+    log.success(`Email preenchido: ${CONFIG.email}`);
+    await page.waitForTimeout(500);
+    await screenshot(page, "03_email_filled");
+
+    // Clicar "Avançar"
+    const avancarBtn = page.locator('button:has-text("Avançar"), button:has-text("Avancar"), button:has-text("Next"), button[type="submit"]').first();
+    await avancarBtn.waitFor({ state: "visible", timeout: 5000 });
+    await avancarBtn.click();
+    log.info("Clicou em 'Avançar'.");
   } catch (e) {
-    log.debug(`Estratégia 1 falhou: ${e.message}`);
+    // Pode ser que email e senha estejam na mesma página
+    log.warn(`Campo de email ou botão Avançar não encontrado: ${e.message}`);
+    log.info("Tentando preencher email e senha na mesma página...");
   }
 
-  // Estratégia 2: Clicar diretamente no texto do workspace visível
-  if (!dropdownOpened) {
-    try {
-      const wsText = page.getByText(/v4company|V4 Company/i).first();
-      if (await wsText.isVisible({ timeout: 3000 })) {
-        await wsText.click();
-        dropdownOpened = true;
-        await page.waitForTimeout(1500);
-        log.debug("Dropdown aberto via texto direto.");
-      }
-    } catch (_) {}
-  }
+  // Espera a senha aparecer
+  await page.waitForTimeout(3000);
+  await screenshot(page, "04_password_page");
 
-  // Estratégia 3: Buscar por select nativo ou custom dropdown
-  if (!dropdownOpened) {
-    try {
-      const selects = page.locator('select');
-      const selectCount = await selects.count();
-      for (let i = 0; i < selectCount; i++) {
-        const options = await selects.nth(i).locator('option').allTextContents();
-        if (options.some(o => o.includes("Ferraz") || o.includes("V4 Company"))) {
-          await selects.nth(i).selectOption({ label: options.find(o => o.includes("Ferraz") || o.includes("V4 Company")) });
-          log.success("Workspace selecionado via <select> nativo.");
-          await page.waitForTimeout(3000);
-          await page.waitForLoadState("networkidle");
-          await debugScreenshot(page, "04_workspace_selected");
-          return;
-        }
-      }
-    } catch (_) {}
-  }
+  // ── Etapa 3: Preencher senha → clicar "Entrar" ───────────────────────────
+  log.info("Etapa 3/3: Preenchendo senha...");
 
-  await debugScreenshot(page, "04_dropdown_opened");
-
-  // Agora seleciona "V4 Company Ferraz Piai & ..."
-  if (dropdownOpened) {
-    try {
-      // Procura o item do dropdown com o texto correto
-      const targetSelectors = [
-        `text=V4 Company Ferraz Piai`,
-        `text=Ferraz Piai`,
-        `:text("V4 Company Ferraz")`,
-        `li:has-text("Ferraz Piai")`,
-        `div:has-text("Ferraz Piai")`,
-        `a:has-text("Ferraz Piai")`,
-        `[role="option"]:has-text("Ferraz")`,
-        `[role="menuitem"]:has-text("Ferraz")`,
-      ];
-
-      for (const sel of targetSelectors) {
-        try {
-          const item = page.locator(sel).first();
-          if (await item.isVisible({ timeout: 2000 })) {
-            await item.click();
-            log.success(`Workspace "${CONFIG.workspaceName}" selecionado!`);
-            await page.waitForTimeout(3000);
-            await page.waitForLoadState("networkidle").catch(() => {});
-            await debugScreenshot(page, "05_workspace_selected");
-            return;
-          }
-        } catch (_) {}
-      }
-
-      log.warn("Dropdown aberto mas não encontrou o workspace alvo. Tentando por posição...");
-      
-      // Fallback: clica no primeiro item do dropdown (que nos screenshots é "V4 Company Ferraz Piai & ...")
-      const listItems = page.locator('[role="option"], [role="menuitem"], li, [class*="item"], [class*="option"]');
-      const itemCount = await listItems.count();
-      
-      for (let i = 0; i < itemCount; i++) {
-        const text = await listItems.nth(i).textContent({ timeout: 1000 }).catch(() => "");
-        if (text.includes("Ferraz") || text.includes("V4 Company Ferraz")) {
-          await listItems.nth(i).click();
-          log.success("Workspace selecionado por scan de lista.");
-          await page.waitForTimeout(3000);
-          await page.waitForLoadState("networkidle").catch(() => {});
-          await debugScreenshot(page, "05_workspace_selected");
-          return;
-        }
-      }
-
-    } catch (e) {
-      log.warn(`Erro ao selecionar workspace: ${e.message}`);
-    }
-  }
-
-  // Último fallback: navegar diretamente pela URL com o workspace correto
-  log.warn("Não conseguiu selecionar workspace via UI. Tentando navegar pela URL direta...");
+  const passwordInput = page.locator('input[type="password"]').first();
   try {
-    await page.goto(`${CONFIG.baseUrl}/v4-company-ferraz-piai-%26-co.`, {
-      waitUntil: "networkidle",
-      timeout: CONFIG.timeout,
-    });
-    await page.waitForTimeout(3000);
-    await debugScreenshot(page, "05_workspace_url_direct");
-    log.info("Navegou direto para URL do workspace.");
+    await passwordInput.waitFor({ state: "visible", timeout: 10000 });
+    await passwordInput.fill(CONFIG.password);
+    log.success("Senha preenchida.");
+    await page.waitForTimeout(500);
+    await screenshot(page, "05_password_filled");
+
+    // Clicar "Entrar"
+    const entrarBtn = page.locator('button:has-text("Entrar"), button:has-text("Login"), button:has-text("Sign in"), button[type="submit"]').first();
+    await entrarBtn.waitFor({ state: "visible", timeout: 5000 });
+    await entrarBtn.click();
+    log.info("Clicou em 'Entrar'.");
   } catch (e) {
-    log.error(`Falha ao navegar para workspace: ${e.message}`);
+    log.error(`Erro ao preencher senha: ${e.message}`);
+    throw new Error("Falha no login: campo de senha não encontrado.");
   }
+
+  // Espera redirecionamento de volta para brokers.mktlab.app
+  log.info("Aguardando redirecionamento pós-login...");
+  try {
+    await page.waitForURL(/brokers\.mktlab\.app/, { timeout: 30000 });
+  } catch (_) {
+    // Pode ter ficado no identity — tenta esperar mais
+    await page.waitForTimeout(5000);
+  }
+  await page.waitForLoadState("networkidle").catch(() => {});
+  await page.waitForTimeout(3000);
+  await screenshot(page, "06_after_login");
+
+  const postLoginUrl = page.url();
+  log.success(`Login concluído. URL atual: ${postLoginUrl}`);
+
+  // Verifica se o login realmente funcionou
+  const bodyText = await page.evaluate(() => document.body.innerText).catch(() => "");
+  if (bodyText.includes("Acesse sua conta") || bodyText.includes("Acessar Lead Brokers")) {
+    throw new Error("Login falhou — ainda na página de login.");
+  }
+
+  log.success("Login verificado com sucesso!");
 }
 
-// ─── Step 3: Navegar para Meus Leads ──────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// STEP 2: Navegar para workspace correto via URL direta
+// ═══════════════════════════════════════════════════════════════════════════════
+async function navigateToWorkspace(page) {
+  log.info(`Navegando direto para workspace: ${CONFIG.workspaceUrl}`);
+  await page.goto(CONFIG.workspaceUrl, { waitUntil: "networkidle", timeout: CONFIG.timeout });
+  await page.waitForTimeout(3000);
+  await screenshot(page, "07_workspace");
+
+  // Verifica se caiu no workspace certo (deve ter cards de leads ou menu)
+  const bodyText = await page.evaluate(() => document.body.innerText).catch(() => "");
+  if (bodyText.includes("Erro inesperado")) {
+    log.error("Workspace mostra 'Erro inesperado'. Pode não ter autenticado corretamente.");
+    throw new Error("Workspace com erro inesperado.");
+  }
+
+  const currentUrl = page.url();
+  log.success(`No workspace correto. URL: ${currentUrl}`);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STEP 3: Navegar para "Meus Leads"
+// ═══════════════════════════════════════════════════════════════════════════════
 async function navigateToMeusLeads(page) {
   log.info("Navegando para Meus Leads...");
 
-  // Tenta clicar no link do menu lateral
-  const menuSelectors = [
+  // Tenta clicar no link do sidebar (ícone de carrinho de compras)
+  const selectors = [
     'a:has-text("Meus Leads")',
     'text=Meus Leads',
     '[href*="product-preview"]',
-    'nav a:has-text("Leads")',
-    'aside a:has-text("Leads")',
+    // Ícone no sidebar — baseado no screenshot, é o 4º ícone
+    'nav a[href*="product"]',
+    'aside a[href*="product"]',
   ];
 
-  for (const sel of menuSelectors) {
+  for (const sel of selectors) {
     try {
       const link = page.locator(sel).first();
       if (await link.isVisible({ timeout: 3000 })) {
         await link.click();
         await page.waitForLoadState("networkidle").catch(() => {});
         await page.waitForTimeout(3000);
-        log.success("Página Meus Leads carregada via menu.");
-        await debugScreenshot(page, "06_meus_leads");
-        return;
+        await screenshot(page, "08_meus_leads_via_menu");
+
+        // Verificar se chegou na página certa
+        const url = page.url();
+        const text = await page.evaluate(() => document.body.innerText).catch(() => "");
+        if (url.includes("product-preview") || text.includes("Minhas Aquisições") || text.includes("Exportar")) {
+          log.success("Página Meus Leads carregada via menu.");
+          return;
+        }
       }
     } catch (_) {}
   }
 
   // Fallback: URL direta
   log.info("Menu não encontrado, tentando URL direta...");
-  await page.goto(`${CONFIG.baseUrl}/v4-company-ferraz-piai-%26-co./product-preview`, {
-    waitUntil: "networkidle",
-    timeout: CONFIG.timeout,
-  });
+  const meusLeadsUrl = CONFIG.workspaceUrl.replace(/\/?$/, "") + "/product-preview";
+  log.debug(`URL Meus Leads: ${meusLeadsUrl}`);
+  await page.goto(meusLeadsUrl, { waitUntil: "networkidle", timeout: CONFIG.timeout });
   await page.waitForTimeout(3000);
-  await debugScreenshot(page, "06_meus_leads_direct");
-  log.success("Página Meus Leads carregada via URL direta.");
+  await screenshot(page, "08_meus_leads_direct");
+
+  // Verificar se está na página correta
+  const bodyText = await page.evaluate(() => document.body.innerText).catch(() => "");
+  if (bodyText.includes("Acesse sua conta") || bodyText.includes("Acessar Lead Brokers")) {
+    throw new Error("Redirecionado para login — sessão perdida.");
+  }
+
+  if (bodyText.includes("Minhas Aquisições") || bodyText.includes("Exportar")) {
+    log.success("Página Meus Leads carregada via URL direta.");
+  } else {
+    log.warn("Não tenho certeza se estamos na página correta. Continuando...");
+    await screenshot(page, "08_meus_leads_uncertain");
+  }
 }
 
-// ─── Step 4: Exportar CSV ─────────────────────────────────────────────────────
-async function exportCSV(page) {
-  log.info("Tentando exportar CSV...");
+// ═══════════════════════════════════════════════════════════════════════════════
+// STEP 4: Exportar dados (CSV ou scrape da tabela)
+// ═══════════════════════════════════════════════════════════════════════════════
+async function exportData(page) {
+  log.info("Exportando dados...");
   fs.mkdirSync(CONFIG.outputDir, { recursive: true });
 
-  // ── Estratégia A: Botão Exportar com download event ──────────────────────
-  const exportSelectors = [
-    'button:has-text("Exportar")',
-    'a:has-text("Exportar")',
-    ':text("Exportar")',
-    'button:has-text("Export")',
-    '[class*="export"]',
-    // O botão na screenshot parece ter um ícone de download
-    'button:has([class*="download"])',
-    'a:has([class*="download"])',
-  ];
-
-  for (const sel of exportSelectors) {
-    try {
-      const btn = page.locator(sel).first();
-      if (await btn.isVisible({ timeout: 5000 })) {
-        log.info(`Botão Exportar encontrado: ${sel}`);
-        await debugScreenshot(page, "07_before_export");
-
-        try {
-          // Tenta capturar download
-          const [download] = await Promise.all([
-            page.waitForEvent("download", { timeout: 30000 }),
-            btn.click(),
-          ]);
-
-          const downloadPath = path.join(CONFIG.outputDir, `leads_${getTimestamp()}.csv`);
-          await download.saveAs(downloadPath);
-          log.success(`CSV baixado: ${downloadPath}`);
-          return { method: "csv_download", filePath: downloadPath };
-        } catch (downloadErr) {
-          log.warn(`Download event não disparou: ${downloadErr.message}`);
-          
-          // Talvez o botão tenha aberto algo — esperar e tentar de novo
-          await page.waitForTimeout(3000);
-
-          // Verificar se abriu um blob/URL de download
-          const pages = page.context().pages();
-          if (pages.length > 1) {
-            const newPage = pages[pages.length - 1];
-            const url = newPage.url();
-            if (url.includes("blob:") || url.includes(".csv")) {
-              const content = await newPage.content();
-              const csvPath = path.join(CONFIG.outputDir, `leads_${getTimestamp()}.csv`);
-              fs.writeFileSync(csvPath, content, "utf-8");
-              await newPage.close();
-              log.success(`CSV capturado de nova aba: ${csvPath}`);
-              return { method: "csv_newtab", filePath: csvPath };
-            }
-          }
-        }
-        break; // Botão encontrado mas download falhou — vai pro fallback
-      }
-    } catch (_) {}
-  }
-
-  // ── Estratégia B: Interceptar requests de rede ───────────────────────────
-  log.info("Tentando interceptar request de exportação via rede...");
+  // Garantir que a aba "Aquisições" está selecionada
   try {
-    let csvResponse = null;
-
-    page.on("response", async (response) => {
-      const url = response.url();
-      const contentType = response.headers()["content-type"] || "";
-      if (
-        url.includes("export") ||
-        url.includes("csv") ||
-        url.includes("download") ||
-        contentType.includes("csv") ||
-        contentType.includes("octet-stream")
-      ) {
-        csvResponse = response;
-      }
-    });
-
-    // Tenta clicar no exportar de novo
-    const btn = page.locator('button:has-text("Exportar"), a:has-text("Exportar"), :text("Exportar")').first();
-    if (await btn.isVisible({ timeout: 3000 }).catch(() => false)) {
-      await btn.click();
-      await page.waitForTimeout(10000);
-
-      if (csvResponse) {
-        const body = await csvResponse.body();
-        const csvPath = path.join(CONFIG.outputDir, `leads_${getTimestamp()}.csv`);
-        fs.writeFileSync(csvPath, body);
-        log.success(`CSV capturado via interceptação de rede: ${csvPath}`);
-        return { method: "csv_intercept", filePath: csvPath };
-      }
+    const aquisTab = page.locator('button:has-text("Aquisições"), a:has-text("Aquisições"), [role="tab"]:has-text("Aquisições")').first();
+    if (await aquisTab.isVisible({ timeout: 3000 })) {
+      await aquisTab.click();
+      await page.waitForTimeout(2000);
+      log.info("Aba 'Aquisições' selecionada.");
     }
-  } catch (e) {
-    log.debug(`Interceptação de rede falhou: ${e.message}`);
+  } catch (_) {}
+
+  // ── Estratégia A: Botão Exportar → download de CSV ───────────────────────
+  const exportBtn = page.locator('button:has-text("Exportar"), a:has-text("Exportar")').first();
+  if (await exportBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
+    log.info("Botão 'Exportar' encontrado. Tentando download...");
+    await screenshot(page, "09_before_export");
+
+    try {
+      const [download] = await Promise.all([
+        page.waitForEvent("download", { timeout: 30000 }),
+        exportBtn.click(),
+      ]);
+      const csvPath = path.join(CONFIG.outputDir, `leads_${getTimestamp()}.csv`);
+      await download.saveAs(csvPath);
+      log.success(`CSV baixado: ${csvPath}`);
+      return { method: "csv", filePath: csvPath };
+    } catch (e) {
+      log.warn(`Download do CSV falhou: ${e.message}`);
+      // Pode ser que o "Exportar" dispare um fetch/XHR ao invés de download
+    }
+
+    // Tenta interceptar via network
+    try {
+      log.info("Tentando interceptar resposta de rede...");
+      const responsePromise = page.waitForResponse(
+        (resp) => {
+          const ct = resp.headers()["content-type"] || "";
+          const url = resp.url();
+          return ct.includes("csv") || ct.includes("octet") || ct.includes("excel") ||
+                 url.includes("export") || url.includes("csv") || url.includes("download");
+        },
+        { timeout: 15000 }
+      );
+      await exportBtn.click();
+      const resp = await responsePromise;
+      const body = await resp.body();
+      const csvPath = path.join(CONFIG.outputDir, `leads_${getTimestamp()}.csv`);
+      fs.writeFileSync(csvPath, body);
+      log.success(`CSV capturado via rede: ${csvPath}`);
+      return { method: "csv_network", filePath: csvPath };
+    } catch (e) {
+      log.warn(`Interceptação de rede falhou: ${e.message}`);
+    }
+  } else {
+    log.warn("Botão 'Exportar' NÃO encontrado na página.");
   }
 
-  // ── Estratégia C (Fallback): Scrape direto da tabela HTML ────────────────
-  log.warn("CSV export falhou. Extraindo dados direto da tabela HTML...");
-  return await scrapeTableDOM(page);
+  // ── Estratégia B: Scrape da tabela HTML ──────────────────────────────────
+  log.info("Fallback: extraindo dados da tabela HTML...");
+  return await scrapeTable(page);
 }
 
-// ─── Fallback: Scrape Table DOM ───────────────────────────────────────────────
-async function scrapeTableDOM(page) {
-  await debugScreenshot(page, "08_table_scrape_start");
+async function scrapeTable(page) {
+  await screenshot(page, "10_table_scrape");
 
-  // Espera a tabela carregar
+  // Espera a tabela aparecer
   try {
-    await page.waitForSelector("table, [class*='table'], [role='table'], [class*='list']", {
-      timeout: 15000,
-    });
+    await page.waitForSelector("table", { timeout: 10000 });
   } catch (_) {
-    log.warn("Tabela não encontrada na página.");
+    log.warn("Nenhuma <table> encontrada.");
   }
 
-  // Extrai dados da tabela
+  // Scroll para carregar todos os dados (caso tenha lazy loading)
+  let previousHeight = 0;
+  for (let i = 0; i < 10; i++) {
+    const currentHeight = await page.evaluate(() => document.body.scrollHeight);
+    if (currentHeight === previousHeight) break;
+    previousHeight = currentHeight;
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await page.waitForTimeout(1500);
+  }
+
   const leads = await page.evaluate(() => {
     const results = [];
-
-    // Estratégia 1: Tabela HTML padrão
     const table = document.querySelector("table");
-    if (table) {
-      const rows = table.querySelectorAll("tbody tr, tr");
-      const headers = [];
+    if (!table) return results;
 
-      // Pega headers
-      const headerRow = table.querySelector("thead tr, tr:first-child");
-      if (headerRow) {
-        headerRow.querySelectorAll("th, td").forEach((th) => {
-          headers.push(th.textContent.trim().toLowerCase());
-        });
-      }
+    // Extrai headers
+    const headerCells = table.querySelectorAll("thead th, thead td, tr:first-child th, tr:first-child td");
+    const headers = [];
+    headerCells.forEach((h) => headers.push(h.textContent.trim()));
 
-      rows.forEach((row) => {
-        const cells = row.querySelectorAll("td");
-        if (cells.length < 3) return; // Pula rows inválidas
+    // Extrai rows
+    const rows = table.querySelectorAll("tbody tr");
+    rows.forEach((row) => {
+      const cells = row.querySelectorAll("td");
+      if (cells.length < 3) return;
 
-        const rowData = {};
-        cells.forEach((cell, idx) => {
-          if (headers[idx]) {
-            rowData[headers[idx]] = cell.textContent.trim();
-          } else {
-            rowData[`col_${idx}`] = cell.textContent.trim();
-          }
-        });
-
-        if (Object.keys(rowData).length > 0) {
-          results.push(rowData);
-        }
+      const rowData = {};
+      cells.forEach((cell, idx) => {
+        const key = headers[idx] || `col_${idx}`;
+        rowData[key] = cell.textContent.trim();
       });
-    }
-
-    // Estratégia 2: Cards ou lista customizada (caso não tenha table)
-    if (results.length === 0) {
-      // Procura por cards/items que contenham dados de leads
-      const cards = document.querySelectorAll(
-        '[class*="card"], [class*="item"], [class*="row"], [class*="lead"]'
-      );
-      cards.forEach((card) => {
-        const text = card.textContent || "";
-        if (text.includes("Lead") || text.includes("R$")) {
-          results.push({ raw_text: text.trim().substring(0, 500) });
-        }
-      });
-    }
+      results.push(rowData);
+    });
 
     return results;
   });
 
-  log.info(`Extraídos ${leads.length} registros da tabela HTML.`);
+  log.info(`Tabela HTML: ${leads.length} registros extraídos.`);
 
-  if (leads.length === 0) {
-    log.error("Nenhum dado encontrado na tabela.");
-
-    // Último recurso: pegar TODO o conteúdo da página para debug
-    await debugScreenshot(page, "09_no_data_found");
-    const pageText = await page.evaluate(() => document.body.innerText);
-    const debugPath = path.join(CONFIG.outputDir, `page_text_${getTimestamp()}.txt`);
-    fs.writeFileSync(debugPath, pageText, "utf-8");
-    log.info(`Texto da página salvo para debug: ${debugPath}`);
-
-    return { method: "table_scrape", leads: [], filePath: null };
+  if (leads.length > 0) {
+    log.debug(`Headers encontrados: ${Object.keys(leads[0]).join(", ")}`);
+    log.debug(`Primeiro registro: ${JSON.stringify(leads[0])}`);
   }
 
   return { method: "table_scrape", leads, filePath: null };
 }
 
-// ─── Step 5: Processar dados ──────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// STEP 5: Extrair detalhes clicando em cada lead (para pegar CNPJ e Faturamento)
+// ═══════════════════════════════════════════════════════════════════════════════
+async function enrichLeadsFromDetails(page, leads) {
+  // A tabela "Meus Leads" não tem coluna de CNPJ/Faturamento/Segmento
+  // Esses campos só aparecem quando clicamos no card do lead (painel de detalhes)
+  // Se já temos os dados do CSV, pula esta etapa
+  
+  if (leads.length === 0) return leads;
+
+  // Verifica se já temos faturamento (se sim, veio do CSV completo)
+  const hasFaturamento = leads.some(l => l.faturamento && l.faturamento !== "");
+  if (hasFaturamento) {
+    log.info("Dados já contêm faturamento — pulando enriquecimento.");
+    return leads;
+  }
+
+  log.info("Tabela não tem CNPJ/Faturamento. Tentando enriquecer via detalhes dos cards...");
+  
+  // Volta para a página principal do workspace (onde tem os cards)
+  try {
+    await page.goto(CONFIG.workspaceUrl, { waitUntil: "networkidle", timeout: CONFIG.timeout });
+    await page.waitForTimeout(3000);
+  } catch (_) {
+    log.warn("Não conseguiu voltar para página de cards.");
+    return leads;
+  }
+
+  // Para cada lead, tenta clicar no card e pegar os detalhes
+  // Isso é opcional e mais lento — só faz se necessário
+  // Por ora, retorna os dados que temos
+  log.info("Enriquecimento via cards não implementado nesta versão. Use CSV se possível.");
+  return leads;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STEP 6: Processar e normalizar dados
+// ═══════════════════════════════════════════════════════════════════════════════
 function processData(exportResult) {
   let leads = [];
 
   if (exportResult.filePath) {
-    // CSV foi baixado — parsear
-    const rawCsv = fs.readFileSync(exportResult.filePath, "utf-8");
-    
-    // Detectar delimitador
-    const firstLine = rawCsv.split("\n")[0] || "";
-    const delimiter = firstLine.includes(";") ? ";" : ",";
+    // Parse CSV
+    const raw = fs.readFileSync(exportResult.filePath, "utf-8");
+    const delimiter = raw.split("\n")[0].includes(";") ? ";" : ",";
+    const lines = raw.split("\n").filter((l) => l.trim());
+    if (lines.length < 2) return [];
 
-    const lines = rawCsv.split("\n").filter((l) => l.trim());
-    if (lines.length < 2) {
-      log.warn("CSV vazio ou com apenas header.");
-      return [];
-    }
-
-    const headers = lines[0].split(delimiter).map((h) => h.trim().replace(/^"|"$/g, "").toLowerCase());
-    log.debug(`Headers CSV: ${headers.join(" | ")}`);
+    const headers = lines[0].split(delimiter).map((h) => h.trim().replace(/^"|"$/g, ""));
+    log.debug(`CSV headers: ${headers.join(" | ")}`);
 
     for (let i = 1; i < lines.length; i++) {
-      const values = lines[i].split(delimiter).map((v) => v.trim().replace(/^"|"$/g, ""));
+      // Handle quoted CSV values with delimiters inside
+      const values = parseCSVLine(lines[i], delimiter);
       const row = {};
-      headers.forEach((h, idx) => {
-        row[h] = values[idx] || "";
-      });
-
-      leads.push({
-        nome_empresa: findCol(row, ["empresa", "nome da empresa", "company", "nome_empresa"]),
-        cnpj: findCol(row, ["documento da empresa", "cnpj", "documento", "cpf_cnpj", "document"]),
-        faturamento: findCol(row, ["faturamento", "revenue", "billing"]),
-        segmento: findCol(row, ["segmento", "segment"]),
-        responsavel: findCol(row, ["responsável", "responsavel", "nome", "contact"]),
-        telefone: findCol(row, ["telefone", "phone", "tel"]),
-        email: findCol(row, ["e-mail", "email"]),
-        valor: findCol(row, ["valor", "value", "price"]),
-        data_compra: findCol(row, ["data/hora de compra", "data_compra", "data", "date"]),
-      });
+      headers.forEach((h, idx) => { row[h] = (values[idx] || "").trim(); });
+      leads.push(mapFields(row));
     }
   } else if (exportResult.leads) {
-    // Dados vieram do scrape da tabela
-    leads = exportResult.leads.map((row) => ({
-      nome_empresa: findCol(row, ["empresa", "nome da empresa", "company"]),
-      cnpj: findCol(row, ["documento da empresa", "cnpj", "documento"]),
-      faturamento: findCol(row, ["faturamento", "revenue"]),
-      segmento: findCol(row, ["segmento", "segment"]),
-      responsavel: findCol(row, ["responsável", "responsavel"]),
-      telefone: findCol(row, ["telefone", "phone"]),
-      email: findCol(row, ["e-mail", "email"]),
-      valor: findCol(row, ["valor", "value"]),
-      data_compra: findCol(row, ["data/hora de compra", "data_compra", "data"]),
-      raw_text: row.raw_text || undefined,
-    }));
+    leads = exportResult.leads.map(mapFields);
   }
 
   return leads;
 }
 
-function findCol(row, possibleNames) {
-  const normalize = (str) =>
-    str.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim();
+function mapFields(row) {
+  return {
+    nome_empresa: fc(row, ["empresa", "nome da empresa", "company", "nome_empresa"]),
+    cnpj: fc(row, ["documento da empresa", "cnpj", "documento", "cpf_cnpj"]),
+    faturamento: fc(row, ["faturamento", "revenue"]),
+    segmento: fc(row, ["segmento", "segment"]),
+    responsavel: fc(row, ["responsável", "responsavel", "contact"]),
+    telefone: fc(row, ["telefone", "phone"]),
+    email: fc(row, ["e-mail", "email"]),
+    valor: fc(row, ["valor", "value"]),
+    cargo: fc(row, ["cargo", "role", "position"]),
+    data_compra: fc(row, ["data/hora de compra", "data_compra", "data", "date"]),
+    tipo: fc(row, ["tipo", "type"]),
+    arrematador: fc(row, ["arrematador", "buyer"]),
+  };
+}
+
+function fc(row, names) {
+  const norm = (s) => s.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim();
   for (const key of Object.keys(row)) {
-    const nk = normalize(key);
-    for (const name of possibleNames) {
-      if (nk === normalize(name) || nk.includes(normalize(name))) {
+    for (const name of names) {
+      if (norm(key) === norm(name) || norm(key).includes(norm(name))) {
         return row[key] || "";
       }
     }
@@ -626,42 +456,65 @@ function findCol(row, possibleNames) {
   return "";
 }
 
-// ─── Step 6: Enviar para webhook ──────────────────────────────────────────────
-async function sendToWebhook(leads) {
+function parseCSVLine(line, delimiter) {
+  const result = [];
+  let current = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      inQuotes = !inQuotes;
+    } else if (ch === delimiter && !inQuotes) {
+      result.push(current.trim().replace(/^"|"$/g, ""));
+      current = "";
+    } else {
+      current += ch;
+    }
+  }
+  result.push(current.trim().replace(/^"|"$/g, ""));
+  return result;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STEP 7: Enviar webhook
+// ═══════════════════════════════════════════════════════════════════════════════
+async function sendWebhook(leads) {
   if (!CONFIG.webhookUrl) {
-    log.info("Webhook não configurado — pulando envio.");
+    log.info("Webhook não configurado.");
+    return;
+  }
+  if (leads.length === 0) {
+    log.warn("Nenhum lead para enviar — pulando webhook.");
     return;
   }
 
   log.info(`Enviando ${leads.length} leads para webhook...`);
-
-  const response = await fetch(CONFIG.webhookUrl, {
+  const resp = await fetch(CONFIG.webhookUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       timestamp: new Date().toISOString(),
-      source: "brokers-lead-exporter-v2",
+      source: "brokers-lead-exporter-v3",
       total: leads.length,
       leads,
     }),
   });
 
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    throw new Error(`Webhook retornou ${response.status}: ${text}`);
+  if (!resp.ok) {
+    throw new Error(`Webhook ${resp.status}: ${await resp.text().catch(() => "")}`);
   }
-
-  log.success("Webhook disparado com sucesso.");
+  log.success("Webhook OK.");
 }
 
-// ─── Main Scrape Flow ─────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// Main scrape flow
+// ═══════════════════════════════════════════════════════════════════════════════
 async function scrape() {
   if (!CONFIG.email || !CONFIG.password) {
-    throw new Error("BROKER_EMAIL e BROKER_PASSWORD são obrigatórios.");
+    throw new Error("BROKER_EMAIL e BROKER_PASSWORD obrigatórios.");
   }
 
   let browser;
-
   try {
     browser = await chromium.launch({
       headless: CONFIG.headless,
@@ -671,66 +524,66 @@ async function scrape() {
     const context = await browser.newContext({
       viewport: { width: 1440, height: 900 },
       acceptDownloads: true,
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     });
 
     const page = await context.newPage();
     page.setDefaultTimeout(CONFIG.timeout);
 
-    // Step 1: Login
+    // Step 1: Login (3 etapas)
     await doLogin(page);
 
-    // Step 2: Selecionar workspace correto
-    await selectWorkspace(page);
+    // Step 2: Ir para workspace correto via URL direta
+    await navigateToWorkspace(page);
 
-    // Step 3: Navegar para Meus Leads
+    // Step 3: Ir para Meus Leads
     await navigateToMeusLeads(page);
 
-    // Verificar se a página carregou corretamente (sem "Erro inesperado")
-    const pageText = await page.evaluate(() => document.body.innerText);
-    if (pageText.includes("Erro inesperado")) {
-      log.error("Página ainda mostra 'Erro inesperado' — workspace pode não ter sido selecionado.");
-      await debugScreenshot(page, "ERROR_inesperado");
-      throw new Error("Página com erro inesperado após seleção de workspace");
+    // Validar que estamos na página certa
+    const bodyText = await page.evaluate(() => document.body.innerText).catch(() => "");
+    if (bodyText.includes("Acesse sua conta")) {
+      throw new Error("Sessão não autenticada — redirecionou para login.");
     }
 
     // Step 4: Exportar
-    const exportResult = await exportCSV(page);
+    const exportResult = await exportData(page);
 
     // Step 5: Processar
     const leads = processData(exportResult);
-    log.info(`${leads.length} leads processados (método: ${exportResult.method}).`);
+    log.info(`${leads.length} leads processados (${exportResult.method}).`);
 
     // Salvar JSON
-    const jsonPath = path.join(CONFIG.outputDir, `leads_${getTimestamp()}.json`);
-    fs.writeFileSync(jsonPath, JSON.stringify(leads, null, 2), "utf-8");
-    log.success(`JSON salvo: ${jsonPath}`);
+    if (leads.length > 0) {
+      const jsonPath = path.join(CONFIG.outputDir, `leads_${getTimestamp()}.json`);
+      fs.writeFileSync(jsonPath, JSON.stringify(leads, null, 2), "utf-8");
+      log.success(`JSON: ${jsonPath}`);
+    }
 
-    // Step 6: Webhook
-    await sendToWebhook(leads);
+    // Step 6: Webhook (só envia se tiver dados válidos)
+    const validLeads = leads.filter(l => l.nome_empresa || l.telefone || l.email);
+    if (validLeads.length > 0) {
+      await sendWebhook(validLeads);
+    } else {
+      log.warn("Nenhum lead válido para enviar (todos sem empresa/telefone/email).");
+      log.warn("Isso pode indicar que o login ou navegação falhou silenciosamente.");
+    }
 
-    // Validação
-    const warnings = [];
-    const noEmpresa = leads.filter((l) => !l.nome_empresa).length;
-    const noCnpj = leads.filter((l) => !l.cnpj).length;
-    if (noEmpresa > 0) warnings.push(`${noEmpresa} leads sem empresa`);
-    if (noCnpj > 0) warnings.push(`${noCnpj} leads sem CNPJ`);
-    if (leads.length === 0) warnings.push("Nenhum lead encontrado!");
-    warnings.forEach((w) => log.warn(w));
+    // Warnings
+    const noEmpresa = leads.filter(l => !l.nome_empresa).length;
+    if (noEmpresa > 0) log.warn(`${noEmpresa} leads sem empresa`);
+    if (leads.length === 0) log.warn("ZERO leads extraídos!");
 
     await browser.close();
-
-    return { success: true, totalLeads: leads.length, method: exportResult.method, warnings };
+    return { success: leads.length > 0, total: leads.length, method: exportResult.method };
   } catch (err) {
-    log.error(`Erro: ${err.message}`);
+    log.error(`ERRO: ${err.message}`);
     if (browser) {
       try {
-        const pages = browser.contexts()[0]?.pages();
-        if (pages?.length > 0) {
-          const errorPath = path.join(CONFIG.outputDir, `error_${getTimestamp()}.png`);
-          await pages[0].screenshot({ path: errorPath, fullPage: true });
-          log.info(`Screenshot de erro: ${errorPath}`);
+        const pg = browser.contexts()[0]?.pages()[0];
+        if (pg) {
+          const errPath = path.join(CONFIG.outputDir, `error_${getTimestamp()}.png`);
+          await pg.screenshot({ path: errPath, fullPage: true });
+          log.info(`Screenshot erro: ${errPath}`);
         }
       } catch (_) {}
       await browser.close();
@@ -739,49 +592,44 @@ async function scrape() {
   }
 }
 
-// ─── Retry wrapper ────────────────────────────────────────────────────────────
 async function scrapeWithRetry() {
-  for (let attempt = 1; attempt <= CONFIG.retryAttempts; attempt++) {
-    log.info(`=== Tentativa ${attempt}/${CONFIG.retryAttempts} ===`);
+  for (let i = 1; i <= CONFIG.retryAttempts; i++) {
+    log.info(`══ Tentativa ${i}/${CONFIG.retryAttempts} ══`);
     try {
       return await scrape();
     } catch (err) {
-      log.error(`Tentativa ${attempt} falhou: ${err.message}`);
-      if (attempt < CONFIG.retryAttempts) {
+      log.error(`Tentativa ${i} falhou: ${err.message}`);
+      if (i < CONFIG.retryAttempts) {
         log.info(`Aguardando ${CONFIG.retryDelayMs / 1000}s...`);
         await sleep(CONFIG.retryDelayMs);
       }
     }
   }
-  log.error("Todas as tentativas falharam neste ciclo.");
-  return { success: false, totalLeads: 0, method: "none", warnings: ["Todas as tentativas falharam"] };
+  return { success: false, total: 0, method: "none" };
 }
 
-// ─── Cron Loop (1h) ──────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// Cron loop
+// ═══════════════════════════════════════════════════════════════════════════════
 async function main() {
   log.info("╔══════════════════════════════════════════════════════╗");
-  log.info("║  Brokers Lead Exporter v2 — V4 Ferraz Piai & Co.   ║");
+  log.info("║  Brokers Lead Exporter v3 — V4 Ferraz Piai & Co.   ║");
   log.info("╚══════════════════════════════════════════════════════╝");
-  log.info(`Intervalo: ${CONFIG.cronIntervalMs / 60000} minutos`);
-  log.info(`Workspace: ${CONFIG.workspaceName}`);
-  log.info(`Webhook: ${CONFIG.webhookUrl ? "configurado" : "NÃO configurado"}`);
-  log.info(`Debug: ${CONFIG.debug ? "ativado" : "desativado"}`);
+  log.info(`Intervalo: ${CONFIG.cronIntervalMs / 60000} min`);
+  log.info(`Workspace URL: ${CONFIG.workspaceUrl}`);
+  log.info(`Webhook: ${CONFIG.webhookUrl ? "OK" : "NÃO CONFIGURADO"}`);
+  log.info(`Debug: ${CONFIG.debug}`);
   log.info("");
 
-  // Primeira execução imediata
-  const result = await scrapeWithRetry();
-  log.info(`Resultado: ${result.success ? "SUCESSO" : "FALHA"} — ${result.totalLeads} leads (${result.method})`);
-
-  // Loop a cada 1 hora
-  log.info(`\nPróxima execução em ${CONFIG.cronIntervalMs / 60000} minutos...\n`);
+  const r = await scrapeWithRetry();
+  log.info(`→ ${r.success ? "SUCESSO" : "FALHA"} — ${r.total} leads (${r.method})`);
+  log.info(`Próxima execução em ${CONFIG.cronIntervalMs / 60000} min...\n`);
 
   setInterval(async () => {
     log.info("═══════════════════════════════════════════════════════");
-    log.info("Iniciando nova execução agendada...");
-    log.info("═══════════════════════════════════════════════════════");
     const r = await scrapeWithRetry();
-    log.info(`Resultado: ${r.success ? "SUCESSO" : "FALHA"} — ${r.totalLeads} leads (${r.method})`);
-    log.info(`\nPróxima execução em ${CONFIG.cronIntervalMs / 60000} minutos...\n`);
+    log.info(`→ ${r.success ? "SUCESSO" : "FALHA"} — ${r.total} leads (${r.method})`);
+    log.info(`Próxima em ${CONFIG.cronIntervalMs / 60000} min...\n`);
   }, CONFIG.cronIntervalMs);
 }
 
