@@ -10,6 +10,4 @@ services:
     env_file: .env
     volumes:
       - ./exports:/app/exports
-    restart: "no" # Execução única — o cron/n8n dispara
-    # Para rodar com cron interno, descomente:
-    # entrypoint: ["sh", "-c", "while true; do node scraper.js; sleep 21600; done"]
+    restart: "no"
