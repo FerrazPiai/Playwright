@@ -1,6 +1,6 @@
 {
   "name": "brokers-lead-exporter",
-  "version": "6.0.0",
+  "version": "7.0.0",
   "main": "scraper.js",
   "scripts": {
     "start": "node scraper.js"

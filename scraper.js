@@ -1,14 +1,16 @@
 /**
- * Brokers MKTLab - Lead Exporter v6
+ * Brokers MKTLab - Lead Exporter v7
  *
- * Fixes from v5:
- * 1. smartType() - removed React native setter hack that conflicted with
- *    pressSequentially(). Only uses keyboard simulation now.
- * 2. Removed form.requestSubmit() fallback - it sent GET requests (400 error).
- * 3. Uses waitForURL with hostname check instead of waitForNavigation('networkidle').
- * 4. Added network request/response logging to diagnose login API failures.
- * 5. Waits for password field after Avançar instead of arbitrary timeout.
- * 6. Updated webhook fields to include all lead detail fields.
+ * ROOT CAUSE (confirmed via v6 network logging):
+ * POST https://v1.identity.mktlab.app/auth/signin returns 400 INVALID_CREDENTIALS.
+ * pressSequentially() updates the DOM value correctly, but React's controlled
+ * component state (v4-input-field) does NOT reflect the typed value. The form
+ * sends empty/partial credentials to the API.
+ *
+ * FIX: Use page.route() to intercept the signin API request and inject the
+ * correct email+password into the request body. This completely bypasses
+ * React's input state management. We still type into the fields (so the UI
+ * enables the submit button), but the actual API call gets correct credentials.
  */
 
 const { chromium } = require("playwright");
@@ -58,54 +60,48 @@ function hn(page) {
 }
 
 /**
- * Type text into a custom v4-input-field using only keyboard simulation.
- * pressSequentially fires real keydown/keypress/input/keyup events that
- * React's synthetic event system picks up correctly.
- *
- * IMPORTANT: Do NOT combine with native setter hack - it conflicts with
- * React's controlled component state and causes the form to submit empty values.
+ * Type text into a v4-input-field for UI purposes (enabling buttons).
+ * The actual credentials are injected via route interception, so this
+ * only needs to make React enable the submit button.
  */
 async function smartType(page, selector, text) {
   L("DBG", `smartType: "${selector}" -> "${text.substring(0, 5)}..."`);
   const input = page.locator(selector).first();
   await input.waitFor({ state: "visible", timeout: 10000 });
 
-  // Focus and select all existing text
+  // Focus
   await input.click();
   await sleep(300);
 
-  // Clear existing content
+  // Clear
   await page.keyboard.press("Control+A");
   await page.keyboard.press("Backspace");
   await sleep(100);
-  await page.keyboard.press("Control+A");
-  await page.keyboard.press("Delete");
-  await sleep(100);
 
-  // Type character by character - this fires real keyboard events
-  // that React processes through its synthetic event system
+  // Type char by char
   await input.pressSequentially(text, { delay: 50 });
   await sleep(500);
 
-  // Verify
+  // Verify DOM value
   const actual = await input.inputValue();
   L(
     "DBG",
-    `smartType result: "${actual}" (expected ${text.length} chars, got ${actual.length})`
+    `smartType DOM value: "${actual}" (expected ${text.length}, got ${actual.length})`
   );
 
+  // If DOM value doesn't match, try native setter as fallback for UI only
   if (actual !== text) {
-    L("WARN", `smartType mismatch! Retrying with slower typing...`);
-    await input.click();
-    await page.keyboard.press("Control+A");
-    await page.keyboard.press("Backspace");
-    await sleep(200);
-    // Retry even slower
-    await input.pressSequentially(text, { delay: 80 });
-    await sleep(500);
-    const retry = await input.inputValue();
-    L("DBG", `smartType retry: "${retry}" (${retry.length} chars)`);
-    return retry === text;
+    L("WARN", "DOM value mismatch, using native setter for UI...");
+    await input.evaluate((el, val) => {
+      const setter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype,
+        "value"
+      ).set;
+      setter.call(el, val);
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    }, text);
+    await sleep(300);
   }
 
   return true;
@@ -117,20 +113,63 @@ async function smartType(page, selector, text) {
 async function doLogin(page) {
   L("INFO", "=== LOGIN START ===");
 
-  // Set up network logging for identity.mktlab.app
-  const apiLogs = [];
+  // ── Set up route interception for the signin API ──────────────────────
+  // This is the KEY FIX: intercept the POST to auth/signin and inject
+  // correct credentials, bypassing React's broken controlled input state.
+  let signinIntercepted = false;
+  await page.route("**/auth/signin", async (route) => {
+    const request = route.request();
+    if (request.method() !== "POST") {
+      await route.continue();
+      return;
+    }
+
+    let body;
+    try {
+      body = JSON.parse(request.postData() || "{}");
+    } catch {
+      body = {};
+    }
+
+    // Log what React actually sent
+    L(
+      "NET",
+      `Intercepted signin POST - Original body: email=${body.email || "MISSING"}, password=${body.password ? `[${body.password.length}chars]` : "MISSING"}`
+    );
+
+    // Inject correct credentials
+    body.email = C.email;
+    body.password = C.password;
+    signinIntercepted = true;
+
+    L("NET", "Injected correct credentials into signin request");
+
+    await route.continue({
+      postData: JSON.stringify(body),
+      headers: {
+        ...request.headers(),
+        "content-type": "application/json",
+      },
+    });
+  });
+
+  // Set up network logging for non-intercepted requests
   page.on("response", async (response) => {
     const url = response.url();
-    if (url.includes("identity.mktlab.app") && !url.includes(".js") && !url.includes(".css") && !url.includes(".png")) {
+    if (
+      url.includes("identity.mktlab.app") &&
+      !url.includes(".js") &&
+      !url.includes(".css") &&
+      !url.includes(".png")
+    ) {
       const status = response.status();
       const method = response.request().method();
-      if (method !== "GET" || status >= 400) {
+      if (status >= 400) {
         let body = "";
         try {
           body = await response.text();
           if (body.length > 500) body = body.substring(0, 500) + "...";
         } catch {}
-        apiLogs.push({ method, url: url.substring(0, 120), status, body });
         L("NET", `${method} ${status} ${url.substring(0, 100)}`);
         if (body) L("NET", `  Response: ${body.substring(0, 300)}`);
       }
@@ -141,10 +180,10 @@ async function doLogin(page) {
   if (fs.existsSync(C.storagePath)) {
     L("INFO", "Testing saved session...");
     try {
-      await page.goto(
-        `${C.baseUrl}/${C.workspace}/product-preview`,
-        { waitUntil: "domcontentloaded", timeout: 20000 }
-      );
+      await page.goto(`${C.baseUrl}/${C.workspace}/product-preview`, {
+        waitUntil: "domcontentloaded",
+        timeout: 20000,
+      });
       await sleep(3000);
       if (hn(page) === "brokers.mktlab.app") {
         const t = await page
@@ -174,7 +213,7 @@ async function doLogin(page) {
   L("INFO", `URL: ${page.url()} | Host: ${hn(page)}`);
   await snap(page, "01_signin");
 
-  // Click "Acessar Lead Brokers" - works with both <a> and <button>
+  // Click "Acessar Lead Brokers"
   const accessBtn = page.getByText("Acessar Lead Brokers").first();
   const accessVisible = await accessBtn
     .isVisible({ timeout: 5000 })
@@ -182,9 +221,7 @@ async function doLogin(page) {
   L("DBG", `accessBtn visible: ${accessVisible}`);
 
   if (!accessVisible) {
-    throw new Error(
-      "Botão 'Acessar Lead Brokers' não encontrado na página de signin"
-    );
+    throw new Error("Botão 'Acessar Lead Brokers' not found");
   }
 
   L("INFO", "Clicking 'Acessar Lead Brokers'...");
@@ -198,32 +235,26 @@ async function doLogin(page) {
     );
     L("OK", "Redirected to identity.mktlab.app");
   } catch {
-    L("WARN", `After click - still on ${hn(page)}, waiting more...`);
+    L("WARN", `After click - still on ${hn(page)}, waiting...`);
     await sleep(3000);
   }
   await sleep(2000);
-  L("INFO", `After step 1 - Host: ${hn(page)} URL: ${page.url()}`);
+  L("INFO", `After step 1 - Host: ${hn(page)}`);
   await snap(page, "02_identity");
 
   if (hn(page) !== "identity.mktlab.app") {
-    throw new Error(
-      `Expected identity.mktlab.app but got ${hn(page)}`
-    );
+    throw new Error(`Expected identity.mktlab.app but got ${hn(page)}`);
   }
 
   // ── STEP 2: Fill email ──────────────────────────────────────────────────
   L("INFO", "STEP 2: Filling email...");
-
-  // Debug: log visible inputs and buttons
   await debugElements(page);
 
-  // Find and fill email field
   const emailSelectors = [
     'input[name="email"]',
     'input[type="email"]',
     'input.v4-input-field[type="email"]',
     'input[placeholder*="mail"]',
-    'input[placeholder*="Mail"]',
     'input[placeholder*="E-mail"]',
   ];
 
@@ -242,7 +273,6 @@ async function doLogin(page) {
   }
 
   if (!emailFilled) {
-    // Fallback: first visible input
     L("WARN", "No email selector matched. Using first visible input...");
     const firstInput = page.locator("input:visible").first();
     if (await firstInput.isVisible({ timeout: 3000 }).catch(() => false)) {
@@ -259,12 +289,9 @@ async function doLogin(page) {
 
   // ── Click Avançar ───────────────────────────────────────────────────────
   L("INFO", "Waiting for 'Avançar' to become enabled...");
-
-  // Wait for the Avançar button to be enabled (React enables it after email validation)
   const avancar = page.getByText("Avançar").first();
   try {
     await avancar.waitFor({ state: "visible", timeout: 5000 });
-    // Wait for it to become enabled
     await page.waitForFunction(
       () => {
         const btn = [...document.querySelectorAll("button")].find((b) =>
@@ -276,35 +303,30 @@ async function doLogin(page) {
     );
     L("OK", "Avançar button enabled");
   } catch {
-    L("WARN", "Avançar button not enabled, trying anyway...");
+    L("WARN", "Avançar not enabled after 5s, trying anyway...");
   }
 
   L("INFO", "Clicking 'Avançar'...");
   await avancar.click();
 
-  // Wait for password field to appear (SPA content swap, not navigation)
+  // Wait for password field (SPA content swap)
   L("INFO", "Waiting for password field...");
-  const pwField = page.locator(
-    'input[type="password"], input[name="password"]'
-  ).first();
+  const pwField = page
+    .locator('input[type="password"], input[name="password"]')
+    .first();
   try {
     await pwField.waitFor({ state: "visible", timeout: 15000 });
     L("OK", "Password field visible.");
   } catch (e) {
-    L("ERR", `Password field NOT found after Avançar: ${e.message}`);
+    L("ERR", `Password field NOT found: ${e.message}`);
     await snap(page, "04_no_password");
-    const bodyText = await page
-      .evaluate(() => document.body.innerText)
-      .catch(() => "");
-    L("DBG", `Page text: ${bodyText.substring(0, 300)}`);
-    throw new Error("Password field not found after clicking Avançar");
+    throw new Error("Password field not found after Avançar");
   }
+  await sleep(500);
   await snap(page, "04_password_page");
 
   // ── STEP 3: Fill password ───────────────────────────────────────────────
   L("INFO", "STEP 3: Filling password...");
-
-  // Debug elements on password page
   await debugElements(page);
 
   await smartType(
@@ -315,8 +337,8 @@ async function doLogin(page) {
   L("OK", "Password typed.");
   await snap(page, "05_password");
 
-  // ── Submit login ────────────────────────────────────────────────────────
-  L("INFO", "Submitting login...");
+  // ── STEP 4: Submit login ──────────────────────────────────────────────
+  L("INFO", "STEP 4: Submitting login...");
 
   // Wait for Entrar button to be enabled
   const entrar = page.getByText("Entrar", { exact: true }).first();
@@ -325,30 +347,48 @@ async function doLogin(page) {
     .catch(() => false);
   L("DBG", `Entrar visible: ${entrarVisible}`);
 
-  if (entrarVisible) {
-    // Wait for enabled
-    try {
-      await page.waitForFunction(
-        () => {
-          const btn = [...document.querySelectorAll("button")].find((b) =>
-            b.textContent.trim() === "Entrar"
-          );
-          return btn && !btn.disabled;
-        },
-        { timeout: 3000 }
-      );
-    } catch {}
+  // Wait for enabled state
+  let entrarEnabled = false;
+  try {
+    await page.waitForFunction(
+      () => {
+        const btn = [...document.querySelectorAll("button")].find(
+          (b) => b.textContent.trim() === "Entrar"
+        );
+        return btn && !btn.disabled;
+      },
+      { timeout: 5000 }
+    );
+    entrarEnabled = true;
+    L("OK", "Entrar button enabled");
+  } catch {
+    L("WARN", "Entrar button still disabled after 5s");
+  }
 
-    // Click and wait for redirect
+  // Log button states after typing
+  await debugElements(page);
+
+  if (entrarVisible && entrarEnabled) {
     L("INFO", "Clicking 'Entrar'...");
     await entrar.click();
+  } else if (entrarVisible) {
+    // Button visible but disabled - force enable and click
+    L("WARN", "Entrar disabled - force enabling via JS...");
+    await page.evaluate(() => {
+      const btn = [...document.querySelectorAll("button")].find(
+        (b) => b.textContent.trim() === "Entrar"
+      );
+      if (btn) {
+        btn.disabled = false;
+        btn.click();
+      }
+    });
   } else {
-    // Fallback: press Enter on password field
-    L("INFO", "Entrar not found, pressing Enter on password field...");
+    L("INFO", "Entrar not found, pressing Enter...");
     await pwField.press("Enter");
   }
 
-  // Wait for redirect away from identity.mktlab.app
+  // Wait for redirect
   L("INFO", "Waiting for redirect after login...");
   try {
     await page.waitForURL(
@@ -362,17 +402,17 @@ async function doLogin(page) {
 
   await sleep(3000);
   L("INFO", `After login - Host: ${hn(page)} URL: ${page.url()}`);
+  L("INFO", `Signin intercepted: ${signinIntercepted}`);
   await snap(page, "06_after_login");
 
-  // If still stuck on identity, try pressing Enter as last resort
+  // If still on identity, check what happened
   if (hn(page) === "identity.mktlab.app") {
-    L("WARN", "Still on identity! Checking for errors...");
+    L("WARN", "Still on identity! Checking errors...");
 
-    // Check for visible error messages
     const errors = await page.evaluate(() => {
       return [
         ...document.querySelectorAll(
-          '[class*="error"],[role="alert"],[class*="alert"],[class*="invalid"],[class*="toast"],[class*="notification"]'
+          '[class*="error"],[role="alert"],[class*="alert"],[class*="invalid"],[class*="toast"]'
         ),
       ]
         .map((e) => e.textContent.trim())
@@ -380,42 +420,25 @@ async function doLogin(page) {
     });
     if (errors.length) {
       L("ERR", `Page errors: ${errors.join(" | ")}`);
-    } else {
-      L("DBG", "No visible error messages on page");
     }
 
-    // Log API responses we captured
-    if (apiLogs.length) {
-      L("DBG", `API calls captured: ${apiLogs.length}`);
-      for (const log of apiLogs) {
-        L("DBG", `  ${log.method} ${log.status} ${log.url}`);
-        if (log.body) L("DBG", `  Body: ${log.body.substring(0, 200)}`);
-      }
-    }
-
-    // Try pressing Enter on password field
-    L("INFO", "Trying Enter key on password field...");
+    // Try one more time: press Enter on password field
+    L("INFO", "Retrying with Enter key...");
     try {
-      const pwStillVisible = await pwField.isVisible().catch(() => false);
-      if (pwStillVisible) {
+      if (await pwField.isVisible().catch(() => false)) {
         await pwField.focus();
         await sleep(200);
         await page.keyboard.press("Enter");
-        await sleep(5000);
-        L("INFO", `After Enter - Host: ${hn(page)}`);
+        try {
+          await page.waitForURL(
+            (url) => new URL(url).hostname !== "identity.mktlab.app",
+            { timeout: 15000 }
+          );
+          L("OK", `Redirected after Enter: ${hn(page)}`);
+        } catch {}
       }
     } catch (e) {
       L("WARN", `Enter retry failed: ${e.message}`);
-    }
-
-    // Final wait for redirect
-    if (hn(page) === "identity.mktlab.app") {
-      try {
-        await page.waitForURL(
-          (url) => new URL(url).hostname !== "identity.mktlab.app",
-          { timeout: 15000 }
-        );
-      } catch {}
     }
   }
 
@@ -425,33 +448,28 @@ async function doLogin(page) {
 
   if (hn(page) === "identity.mktlab.app") {
     // Save debug info
-    const html = await page.content().catch(() => "");
-    fs.writeFileSync(path.join(C.outputDir, `fail_${stamp()}.html`), html);
-    const txt = await page
-      .evaluate(() => document.body.innerText)
-      .catch(() => "");
-    fs.writeFileSync(path.join(C.outputDir, `fail_text_${stamp()}.txt`), txt);
-
-    // Log all captured API responses
-    if (apiLogs.length) {
+    try {
+      const html = await page.content().catch(() => "");
+      fs.writeFileSync(path.join(C.outputDir, `fail_${stamp()}.html`), html);
+      const txt = await page
+        .evaluate(() => document.body.innerText)
+        .catch(() => "");
       fs.writeFileSync(
-        path.join(C.outputDir, `fail_api_${stamp()}.json`),
-        JSON.stringify(apiLogs, null, 2)
+        path.join(C.outputDir, `fail_text_${stamp()}.txt`),
+        txt
       );
-    }
+    } catch {}
 
     L("ERR", "=== LOGIN FAILED ===");
-    L("ERR", "Possible causes:");
-    L("ERR", "  1. Wrong credentials");
-    L("ERR", "  2. Anti-bot detection");
-    L("ERR", "  3. PKCE/OAuth flow rejection");
-    if (apiLogs.some((l) => l.status === 400)) {
-      L("ERR", "  4. API returned 400 - check fail_api_*.json for details");
-    }
+    L("ERR", `Signin API intercepted: ${signinIntercepted}`);
     throw new Error("Login failed - stuck on identity.mktlab.app");
   }
 
   L("OK", "=== LOGIN SUCCESS ===");
+
+  // Remove route interceptor
+  await page.unroute("**/auth/signin");
+
   try {
     await page.context().storageState({ path: C.storagePath });
     L("OK", "Session saved.");
@@ -466,7 +484,7 @@ async function debugElements(page) {
       name: el.name,
       id: el.id,
       placeholder: el.placeholder,
-      className: el.className.substring(0, 60),
+      disabled: el.disabled,
       value: el.value ? `[${el.value.length} chars]` : "[empty]",
     }));
     L("DBG", `  input[${i}]: ${JSON.stringify(attrs)}`);
@@ -498,7 +516,9 @@ async function goToMeusLeads(page) {
       .evaluate(() => document.body.innerText)
       .catch(() => "");
     if (t.includes("Acesse sua conta")) {
-      try { fs.unlinkSync(C.storagePath); } catch {}
+      try {
+        fs.unlinkSync(C.storagePath);
+      } catch {}
       throw new Error("Session lost - redirected to login");
     }
     if (t.includes("Minhas Aquisições") || t.includes("Exportar")) {
@@ -548,7 +568,7 @@ async function exportData(page) {
       L("OK", `CSV downloaded: ${p}`);
       return { method: "csv", file: p };
     } catch (e) {
-      L("WARN", `Download event failed: ${e.message}`);
+      L("WARN", `Download failed: ${e.message}`);
     }
 
     // Method 2: Intercept network response
@@ -568,15 +588,13 @@ async function exportData(page) {
       L("OK", `CSV intercepted: ${p}`);
       return { method: "csv_net", file: p };
     } catch (e) {
-      L("WARN", `Network intercept failed: ${e.message}`);
+      L("WARN", `Intercept failed: ${e.message}`);
     }
   }
 
   // Method 3: Scrape table HTML
   L("INFO", "Falling back to table scraping...");
-  await page
-    .waitForSelector("table", { timeout: 10000 })
-    .catch(() => {});
+  await page.waitForSelector("table", { timeout: 10000 }).catch(() => {});
 
   // Scroll to load all rows
   for (let i = 0; i < 20; i++) {
@@ -619,6 +637,7 @@ function processResults(result) {
     const lines = raw.split("\n").filter((l) => l.trim());
     if (lines.length < 2) return [];
     const hdrs = parseCsvLine(lines[0], sep);
+    L("DBG", `CSV headers: ${hdrs.join(" | ")}`);
     return lines.slice(1).map((l) => {
       const v = parseCsvLine(l, sep);
       const r = {};
@@ -629,9 +648,17 @@ function processResults(result) {
   return (result.rows || []).map(normalizeFields);
 }
 
+/**
+ * Maps CSV/table columns to webhook field names.
+ * Based on actual CSV headers from the platform:
+ * Nome do Produto;Valor;Arrematador;Data;Faturamento;Segmento;Canal;
+ * Nome do responsável;E-mail;Cargo;Telefone;Nome da empresa;País;
+ * Documento da empresa;Tipo de produto;Urgência;Data de criação;
+ * Descrição;Cidade;Estado;Data de aquisição
+ */
 function normalizeFields(r) {
   return {
-    nome_empresa: fc(r, ["empresa", "nome da empresa"]),
+    nome_empresa: fc(r, ["nome da empresa", "empresa"]),
     documento_empresa: fc(r, ["documento da empresa", "cnpj", "documento"]),
     faturamento: fc(r, ["faturamento"]),
     segmento: fc(r, ["segmento"]),
@@ -639,18 +666,19 @@ function normalizeFields(r) {
     email_responsavel: fc(r, ["e-mail", "email"]),
     cargo: fc(r, ["cargo"]),
     telefone: fc(r, ["telefone"]),
-    tipo_produto: fc(r, ["tipo de produto", "tipo"]),
+    tipo_produto: fc(r, ["tipo de produto"]),
     canal: fc(r, ["canal"]),
     descricao: fc(r, ["descrição", "descricao"]),
-    data_criacao: fc(r, ["data de criação", "data de criacao", "data criacao"]),
+    data_criacao: fc(r, ["data de criação", "data de criacao"]),
     urgencia: fc(r, ["urgência", "urgencia"]),
     city: fc(r, ["cidade", "city"]),
     state: fc(r, ["estado", "state"]),
     valor: fc(r, ["valor"]),
-    responsavel: fc(r, ["responsável", "responsavel", "nome do responsável"]),
+    responsavel: fc(r, ["nome do responsável", "responsável", "responsavel"]),
     arrematador: fc(r, ["arrematador"]),
-    data_compra: fc(r, ["data/hora de compra", "data/hora da compra"]),
+    data_compra: fc(r, ["data/hora de compra", "data/hora da compra", "data"]),
     data_aquisicao: fc(r, ["data de aquisição", "data de aquisicao"]),
+    nome_produto: fc(r, ["nome do produto"]),
   };
 }
 
@@ -692,7 +720,7 @@ async function webhook(leads) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       timestamp: new Date().toISOString(),
-      source: "brokers-v6",
+      source: "brokers-v7",
       total: leads.length,
       leads,
     }),
@@ -754,7 +782,7 @@ async function scrape() {
     if (valid.length > 0) {
       await webhook(valid);
     } else {
-      L("WARN", `${leads.length} leads processed but none have valid data.`);
+      L("WARN", `${leads.length} leads but none have valid data.`);
     }
 
     await browser.close();
@@ -784,7 +812,9 @@ async function run() {
     } catch (e) {
       L("ERR", `Attempt ${i}: ${e.message}`);
       if (i < C.retries) {
-        try { fs.unlinkSync(C.storagePath); } catch {}
+        try {
+          fs.unlinkSync(C.storagePath);
+        } catch {}
         await sleep(C.retryDelay);
       }
     }
@@ -794,10 +824,16 @@ async function run() {
 
 async function main() {
   L("INFO", "╔═════════════════════════════════════════════════╗");
-  L("INFO", "║  Brokers Lead Exporter v6 — V4 Ferraz Piai     ║");
+  L("INFO", "║  Brokers Lead Exporter v7 — V4 Ferraz Piai     ║");
   L("INFO", "╚═════════════════════════════════════════════════╝");
-  L("INFO", `Email: ${C.email} | Pass: ${"*".repeat((C.password || "").length)} chars`);
-  L("INFO", `Loop: ${C.interval / 60000}min | Webhook: ${C.webhookUrl ? "OK" : "NO"}`);
+  L(
+    "INFO",
+    `Email: ${C.email} | Pass: ${"*".repeat((C.password || "").length)} chars`
+  );
+  L(
+    "INFO",
+    `Loop: ${C.interval / 60000}min | Webhook: ${C.webhookUrl ? "OK" : "NO"}`
+  );
 
   const r = await run();
   L("INFO", `=> ${r.ok ? "OK" : "FAIL"} - ${r.n} leads (${r.method})`);
