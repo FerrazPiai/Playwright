@@ -14,7 +14,7 @@ const fs = require("fs");
 const path = require("path");
 
 const C = {
-  baseUrl: process.env.BROKER_URL || "https://brokers.mktlab.app",
+  baseUrl: "https://brokers.mktlab.app",
   email: process.env.BROKER_EMAIL,
   password: process.env.BROKER_PASSWORD,
   webhookUrl: process.env.WEBHOOK_URL || "",
