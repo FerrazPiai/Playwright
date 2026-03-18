@@ -1,0 +1,15 @@
+# docker-compose.yml
+# Para testes locais. No Easypanel, configure como App > Docker.
+
+version: "3.8"
+
+services:
+  brokers-scraper:
+    build: .
+    container_name: brokers-lead-exporter
+    env_file: .env
+    volumes:
+      - ./exports:/app/exports
+    restart: "no" # Execução única — o cron/n8n dispara
+    # Para rodar com cron interno, descomente:
+    # entrypoint: ["sh", "-c", "while true; do node scraper.js; sleep 21600; done"]
