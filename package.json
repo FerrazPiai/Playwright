@@ -2,7 +2,12 @@
   "name": "brokers-lead-exporter",
   "version": "5.0.0",
   "main": "scraper.js",
-  "scripts": { "start": "node scraper.js" },
-  "dependencies": { "playwright": "^1.48.0" },
+  "scripts": {
+    "start": "node scraper.js"
+  },
+  "dependencies": {
+    "playwright": "^1.48.0"
+  },
+  "author": "V4 Ferraz Piai & Co.",
   "private": true
 }
