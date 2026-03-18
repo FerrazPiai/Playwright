@@ -5,7 +5,6 @@ RUN npm install --omit=dev && npx playwright install chromium
 COPY scraper.js ./
 RUN mkdir -p /app/exports
 ENV BROKER_URL=https://brokers.mktlab.app
-ENV WORKSPACE_URL=https://brokers.mktlab.app/v4-company-ferraz-piai-&-co.
 ENV HEADLESS=true
 ENV TIMEOUT_MS=60000
 ENV RETRY_ATTEMPTS=3
