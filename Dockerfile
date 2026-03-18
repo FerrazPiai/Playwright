@@ -1,12 +1,10 @@
-FROM mcr.microsoft.com/playwright:v1.48.0-noble
+FROM node:20-slim
 WORKDIR /app
 COPY package.json ./
-RUN npm install --omit=dev && npx playwright install chromium
+RUN npm install --omit=dev 2>/dev/null || true
 COPY scraper.js ./
 RUN mkdir -p /app/exports
 ENV BROKER_URL=https://brokers.mktlab.app
-ENV HEADLESS=true
-ENV TIMEOUT_MS=60000
 ENV RETRY_ATTEMPTS=3
 ENV RETRY_DELAY_MS=5000
 ENV CRON_INTERVAL_MS=3600000
