@@ -162,71 +162,97 @@ async function followRedirects(url, jar, maxRedirects = 10) {
 async function doLogin(jar) {
   L("INFO", "=== LOGIN START (HTTP) ===");
 
-  // STEP 1: Visit brokers signin to get the OAuth redirect URL
-  L("INFO", "STEP 1: GET brokers.mktlab.app/signin...");
-  const signinResp = await httpGet(`${C.baseUrl}/signin`, jar);
-  const signinHtml = await signinResp.text();
-  L("DBG", `Signin page: ${signinResp.status} (${signinHtml.length} bytes)`);
+  // Generate PKCE pair upfront — needed for both identity URL and signin POST
+  const codeVerifier = generateCodeVerifier();
+  const codeChallenge = generateCodeChallenge(codeVerifier);
+  jar._codeVerifier = codeVerifier;
+  L("DBG", `PKCE codeChallenge: ${codeChallenge}`);
 
-  // Extract the "Acessar Lead Brokers" link/action URL
-  // The button/link redirects to identity.mktlab.app with PKCE params
-  // Try to find the href in the HTML
+  const appId = "1169ee93-8f36-4b60-a1b3-abba6c31bba0";
+  const redirectTo = `${C.baseUrl}/auth/token`;
+
+  // STEP 1: Visit brokers signin to extract the OAuth redirect URL
+  L("INFO", "STEP 1: GET brokers.mktlab.app/signin...");
   let identityUrl = null;
 
-  // Look for href pattern to identity.mktlab.app
+  const signinResp = await httpGet(`${C.baseUrl}/signin`, jar);
+  const signinStatus = signinResp.status;
+  const signinHtml = await signinResp.text();
+  L("DBG", `Signin page: ${signinStatus} (${signinHtml.length} bytes)`);
+
+  if (signinStatus === 429) {
+    L("WARN", "Rate limited (429). Using constructed PKCE URL...");
+  }
+
+  // Try to find identity URL in the page HTML
   const hrefMatch = signinHtml.match(
     /href=["'](https?:\/\/identity\.mktlab\.app[^"']+)["']/
   );
   if (hrefMatch) {
     identityUrl = hrefMatch[1].replace(/&amp;/g, "&");
-    L("OK", `Found identity URL in href: ${identityUrl.substring(0, 80)}...`);
+    L("OK", `Found identity URL in href: ${identityUrl.substring(0, 100)}`);
+    // Extract codeChallenge from URL if present (use theirs instead of ours)
+    const ccMatch = identityUrl.match(/codeChallenge=([^&]+)/);
+    if (ccMatch) {
+      L("DBG", `Using server codeChallenge: ${ccMatch[1]}`);
+    }
   }
 
-  // If no href found, the button might trigger a JS redirect
-  // In that case, we'll construct the URL ourselves with PKCE
+  // If no href found, try the no-redirect approach
   if (!identityUrl) {
-    L("INFO", "No href found, constructing PKCE URL manually...");
-
-    // Try clicking by following the signin page's redirect behavior
-    // First, try GET with redirect follow to see where it goes
     const redirectResp = await httpGet(`${C.baseUrl}/signin`, jar, {
       noRedirect: true,
     });
     const loc = redirectResp.headers.get("location");
     if (loc && loc.includes("identity.mktlab.app")) {
       identityUrl = loc;
-      L("OK", `Found redirect: ${identityUrl.substring(0, 80)}...`);
+      L("OK", `Found redirect: ${identityUrl.substring(0, 100)}`);
     }
   }
 
+  // Fallback: construct manually with our PKCE challenge
   if (!identityUrl) {
-    // Construct manually with our own PKCE challenge
-    L("INFO", "Constructing PKCE URL with own code verifier...");
-    const codeVerifier = generateCodeVerifier();
-    const codeChallenge = generateCodeChallenge(codeVerifier);
-    identityUrl = `https://identity.mktlab.app/signin?codeChallenge=${codeChallenge}&redirectTo=${encodeURIComponent(C.baseUrl + "/auth/token")}&appId=1169ee93-8f36-4b60-a1b3-abba6c31bba0`;
-    // Store verifier for later token exchange
-    jar._codeVerifier = codeVerifier;
-    L("DBG", `Generated codeChallenge: ${codeChallenge}`);
-  } else {
-    // Extract codeChallenge from URL for reference
-    const ccMatch = identityUrl.match(/codeChallenge=([^&]+)/);
-    if (ccMatch) L("DBG", `CodeChallenge from URL: ${ccMatch[1]}`);
+    identityUrl = `https://identity.mktlab.app/signin?codeChallenge=${codeChallenge}&codeChallengeMethod=S256&redirectTo=${encodeURIComponent(redirectTo)}&appId=${appId}`;
+    L("INFO", "Using self-generated PKCE URL");
   }
 
-  // STEP 2: Visit identity.mktlab.app to establish cookies
+  // Extract the codeChallenge being used (from URL or our generated one)
+  const usedChallenge =
+    new URL(identityUrl).searchParams.get("codeChallenge") || codeChallenge;
+
+  // STEP 2: Visit identity.mktlab.app to establish session cookies
   L("INFO", "STEP 2: GET identity.mktlab.app/signin...");
   const identityResp = await httpGet(identityUrl, jar);
-  L("DBG", `Identity page: ${identityResp.status}`);
+  const identityHtml = await identityResp.text();
+  L("DBG", `Identity page: ${identityResp.status} (${identityHtml.length} bytes)`);
 
-  // STEP 3: POST to signin API with credentials
+  // Try to extract CSRF token or hidden fields from the identity page
+  const csrfMatch = identityHtml.match(
+    /name=["']?csrf[^"']*["']?\s+value=["']([^"']+)["']/i
+  );
+  if (csrfMatch) L("DBG", `CSRF token found: ${csrfMatch[1].substring(0, 20)}...`);
+
+  // Also look for any appId embedded in the page
+  const appIdMatch = identityHtml.match(
+    /appId["']?\s*[:=]\s*["']([^"']+)["']/
+  );
+  if (appIdMatch) L("DBG", `AppId from page: ${appIdMatch[1]}`);
+
+  // STEP 3: POST to signin API with credentials + PKCE fields
   L("INFO", "STEP 3: POST v1.identity.mktlab.app/auth/signin...");
+  const signinBody = {
+    email: C.email,
+    password: C.password,
+    codeChallenge: usedChallenge,
+    codeChallengeMethod: "S256",
+    redirectTo,
+    appId,
+  };
+  L("DBG", `POST body keys: ${Object.keys(signinBody).join(", ")}`);
+
   const signinApiResp = await httpPost(
     "https://v1.identity.mktlab.app/auth/signin",
-    {
-      email: C.email,
-      password: C.password,
-    },
+    signinBody,
     jar,
     { noRedirect: true }
   );
