@@ -14,7 +14,7 @@ const fs = require("fs");
 const path = require("path");
 
 const C = {
-  baseUrl: "https://brokers.mktlab.app",
+  baseUrl: process.env.BROKER_URL || "https://brokers.mktlab.app",
   email: process.env.BROKER_EMAIL,
   password: process.env.BROKER_PASSWORD,
   webhookUrl: process.env.WEBHOOK_URL || "",
@@ -115,14 +115,33 @@ async function doLogin(page) {
   L("INFO", `URL: ${page.url()} | Host: ${hn(page)}`);
   await snap(page, "01_signin");
 
-  const accessBtn = page.locator('a:has-text("Acessar Lead Brokers")').first();
-  if (await accessBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
+  // Seletor robusto: busca tanto <a> quanto <button> com o texto
+  const accessBtn = page.locator('a:has-text("Acessar Lead Brokers"), button:has-text("Acessar Lead Brokers")').first();
+  const accessVisible = await accessBtn.isVisible({ timeout: 5000 }).catch(() => false);
+  L("DBG", `accessBtn visible: ${accessVisible}`);
+
+  if (accessVisible) {
     L("INFO", "Clicking 'Acessar Lead Brokers'...");
     await Promise.all([
-      page.waitForNavigation({ waitUntil: "networkidle", timeout: 15000 }).catch(() => {}),
+      page.waitForNavigation({ waitUntil: "networkidle", timeout: 15000 }).catch((e) => {
+        L("WARN", `Nav wait after access btn: ${e.message}`);
+      }),
       accessBtn.click(),
     ]);
-    await sleep(2000);
+    await sleep(3000);
+  } else {
+    // Fallback: tenta getByText (agnóstico de tag)
+    L("WARN", "accessBtn não encontrado por seletor. Tentando getByText...");
+    const fallbackBtn = page.getByText("Acessar Lead Brokers", { exact: false }).first();
+    if (await fallbackBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+      await Promise.all([
+        page.waitForNavigation({ waitUntil: "networkidle", timeout: 15000 }).catch(() => {}),
+        fallbackBtn.click(),
+      ]);
+      await sleep(3000);
+    } else {
+      L("WARN", "Nenhum botão 'Acessar Lead Brokers' encontrado na página.");
+    }
   }
   L("INFO", `After step 1 - Host: ${hn(page)} URL: ${page.url()}`);
   await snap(page, "02_identity");
@@ -150,19 +169,57 @@ async function doLogin(page) {
     L("DBG", `  button[${i}]: ${JSON.stringify(info)}`);
   }
 
-  await smartType(page, 'input[name="email"]', C.email);
+  // Seletores de email em ordem de especificidade (com fallbacks)
+  const emailSelectors = [
+    'input[name="email"]',
+    'input[type="email"]',
+    'input.v4-input-field[type="email"]',
+    'input[autocomplete="email"]',
+    'input[placeholder*="mail"]',
+    'input[placeholder*="Mail"]',
+    'input[placeholder*="E-mail"]',
+  ];
+
+  let emailFound = false;
+  for (const sel of emailSelectors) {
+    const visible = await page.locator(sel).first().isVisible({ timeout: 2000 }).catch(() => false);
+    L("DBG", `Email selector "${sel}" visible: ${visible}`);
+    if (visible) {
+      await smartType(page, sel, C.email);
+      emailFound = true;
+      break;
+    }
+  }
+
+  if (!emailFound) {
+    // Fallback final: primeiro input visível na página
+    L("WARN", "Nenhum seletor de email bateu. Usando primeiro input visível...");
+    const firstInput = page.locator('input:visible').first();
+    if (await firstInput.isVisible({ timeout: 3000 }).catch(() => false)) {
+      const inputType = await firstInput.getAttribute("type").catch(() => "unknown");
+      L("DBG", `Usando primeiro input (type=${inputType}) como email.`);
+      await smartType(page, 'input:visible', C.email);
+    } else {
+      throw new Error("Nenhum campo de email encontrado na página.");
+    }
+  }
+
   L("OK", `Email typed: ${C.email}`);
   await snap(page, "03_email");
 
   // Click Avançar
   L("INFO", "Clicking 'Avançar'...");
-  const avancar = page.locator('button[type="submit"]').first();
-  if (await avancar.isVisible({ timeout: 3000 }).catch(() => false)) {
+  const avancar = page.locator('button[type="submit"]:has-text("Avançar"), button:has-text("Avançar"), a:has-text("Avançar")').first();
+  const avancarVis = await avancar.isVisible({ timeout: 5000 }).catch(() => false);
+  L("DBG", `Avançar visible: ${avancarVis}`);
+
+  if (avancarVis) {
     await Promise.all([
-      page.waitForResponse(r => r.url().includes("identity"), { timeout: 10000 }).catch(() => {}),
+      page.waitForNavigation({ waitUntil: "networkidle", timeout: 10000 }).catch(() => {}),
       avancar.click(),
     ]);
   } else {
+    L("WARN", "Botão Avançar não encontrado. Pressionando Enter...");
     await page.keyboard.press("Enter");
   }
   await sleep(3000);
@@ -210,7 +267,7 @@ async function doLogin(page) {
 
   // Submit: Click Entrar with navigation wait
   L("INFO", "Clicking 'Entrar'...");
-  const entrar = page.locator('button[type="submit"]:has-text("Entrar")').first();
+  const entrar = page.locator('button[type="submit"]:has-text("Entrar"), button:has-text("Entrar"), a:has-text("Entrar")').first();
   const entrarVisible = await entrar.isVisible({ timeout: 3000 }).catch(() => false);
   L("DBG", `Entrar visible: ${entrarVisible}`);
 
