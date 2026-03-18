@@ -2,3 +2,4 @@ node_modules/
 exports/
 .env
 *.png
+auth-state.json
