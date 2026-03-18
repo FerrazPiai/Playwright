@@ -1,15 +1,13 @@
 {
   "name": "brokers-lead-exporter",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Automação de extração de leads do Brokers MKTLab via Playwright",
   "main": "scraper.js",
   "scripts": {
-    "start": "node scraper.js",
-    "test": "node scraper.js"
+    "start": "node scraper.js"
   },
   "dependencies": {
-    "playwright": "^1.48.0",
-    "csv-parse": "^5.5.0"
+    "playwright": "^1.48.0"
   },
   "author": "V4 Ferraz Piai & Co.",
   "license": "UNLICENSED",
