@@ -1,5 +1,5 @@
 /**
- * Brokers MKTLab - Lead Exporter v7
+ * Brokers MKTLab - Lead Exporter v8
  *
  * ROOT CAUSE (confirmed via v6 network logging):
  * POST https://v1.identity.mktlab.app/auth/signin returns 400 INVALID_CREDENTIALS.
@@ -8,9 +8,15 @@
  * sends empty/partial credentials to the API.
  *
  * FIX: Use page.route() to intercept the signin API request and inject the
- * correct email+password into the request body. This completely bypasses
- * React's input state management. We still type into the fields (so the UI
- * enables the submit button), but the actual API call gets correct credentials.
+ * correct email+password into the request body. We still type into the fields
+ * (so the UI enables the submit button), but the actual API call gets the
+ * correct credentials from env vars.
+ *
+ * IMPORTANT: Always follow the full 3-step login flow:
+ * 1. brokers.mktlab.app/signin → Click "Acessar Lead Brokers"
+ * 2. identity.mktlab.app → Fill email → Click "Avançar"
+ * 3. identity.mktlab.app → Fill password → Click "Entrar"
+ * Only AFTER login, navigate to the product-preview page.
  */
 
 const { chromium } = require("playwright");
@@ -21,15 +27,18 @@ const C = {
   baseUrl: process.env.BROKER_URL || "https://brokers.mktlab.app",
   email: process.env.BROKER_EMAIL,
   password: process.env.BROKER_PASSWORD,
-  webhookUrl: process.env.WEBHOOK_URL || "",
+  webhookUrl:
+    process.env.WEBHOOK_URL ||
+    "https://ferrazpiai-n8n-editor.uyk8ty.easypanel.host/webhook/dcad05e6-2430-40f8-ab75-3201f6bf931d",
   outputDir: process.env.OUTPUT_DIR || "/app/exports",
   headless: process.env.HEADLESS !== "false",
   timeout: parseInt(process.env.TIMEOUT_MS) || 60000,
   retries: parseInt(process.env.RETRY_ATTEMPTS) || 3,
   retryDelay: parseInt(process.env.RETRY_DELAY_MS) || 5000,
   interval: parseInt(process.env.CRON_INTERVAL_MS) || 3600000,
-  storagePath: "/app/exports/auth-state.json",
   workspace: "v4-company-ferraz-piai-%26-co.",
+  leadsUrl:
+    "https://brokers.mktlab.app/v4-company-ferraz-piai-%26-co./product-preview",
 };
 
 function L(level, msg) {
@@ -61,15 +70,13 @@ function hn(page) {
 
 /**
  * Type text into a v4-input-field for UI purposes (enabling buttons).
- * The actual credentials are injected via route interception, so this
- * only needs to make React enable the submit button.
+ * The actual credentials are injected via route interception.
  */
 async function smartType(page, selector, text) {
   L("DBG", `smartType: "${selector}" -> "${text.substring(0, 5)}..."`);
   const input = page.locator(selector).first();
   await input.waitFor({ state: "visible", timeout: 10000 });
 
-  // Focus
   await input.click();
   await sleep(300);
 
@@ -86,12 +93,12 @@ async function smartType(page, selector, text) {
   const actual = await input.inputValue();
   L(
     "DBG",
-    `smartType DOM value: "${actual}" (expected ${text.length}, got ${actual.length})`
+    `smartType DOM: "${actual}" (expected ${text.length}, got ${actual.length})`
   );
 
-  // If DOM value doesn't match, try native setter as fallback for UI only
+  // If DOM doesn't match, use native setter as UI fallback
   if (actual !== text) {
-    L("WARN", "DOM value mismatch, using native setter for UI...");
+    L("WARN", "DOM mismatch, using native setter for UI...");
     await input.evaluate((el, val) => {
       const setter = Object.getOwnPropertyDescriptor(
         window.HTMLInputElement.prototype,
@@ -108,14 +115,15 @@ async function smartType(page, selector, text) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// LOGIN
+// LOGIN - Always follows the full 3-step flow
 // ═══════════════════════════════════════════════════════════════════════════════
 async function doLogin(page) {
   L("INFO", "=== LOGIN START ===");
 
   // ── Set up route interception for the signin API ──────────────────────
-  // This is the KEY FIX: intercept the POST to auth/signin and inject
-  // correct credentials, bypassing React's broken controlled input state.
+  // This is the KEY FIX: intercept POST to auth/signin and inject correct
+  // credentials, because React's v4-input-field doesn't sync DOM values
+  // to its internal state properly with pressSequentially().
   let signinIntercepted = false;
   await page.route("**/auth/signin", async (route) => {
     const request = route.request();
@@ -131,18 +139,18 @@ async function doLogin(page) {
       body = {};
     }
 
-    // Log what React actually sent
+    // Log what React sent (to confirm the issue)
     L(
       "NET",
-      `Intercepted signin POST - Original body: email=${body.email || "MISSING"}, password=${body.password ? `[${body.password.length}chars]` : "MISSING"}`
+      `Intercepted signin POST - React sent: email=${body.email ? `[${body.email.length}chars]` : "MISSING"}, password=${body.password ? `[${body.password.length}chars]` : "MISSING"}`
     );
 
-    // Inject correct credentials
+    // Inject correct credentials from env vars
     body.email = C.email;
     body.password = C.password;
     signinIntercepted = true;
 
-    L("NET", "Injected correct credentials into signin request");
+    L("NET", "Injected correct credentials into request");
 
     await route.continue({
       postData: JSON.stringify(body),
@@ -153,58 +161,30 @@ async function doLogin(page) {
     });
   });
 
-  // Set up network logging for non-intercepted requests
+  // Set up response logging for errors
   page.on("response", async (response) => {
     const url = response.url();
+    const status = response.status();
     if (
       url.includes("identity.mktlab.app") &&
+      status >= 400 &&
       !url.includes(".js") &&
-      !url.includes(".css") &&
-      !url.includes(".png")
+      !url.includes(".css")
     ) {
-      const status = response.status();
-      const method = response.request().method();
-      if (status >= 400) {
-        let body = "";
-        try {
-          body = await response.text();
-          if (body.length > 500) body = body.substring(0, 500) + "...";
-        } catch {}
-        L("NET", `${method} ${status} ${url.substring(0, 100)}`);
-        if (body) L("NET", `  Response: ${body.substring(0, 300)}`);
-      }
+      let body = "";
+      try {
+        body = await response.text();
+      } catch {}
+      L(
+        "NET",
+        `${response.request().method()} ${status} ${url.substring(0, 100)}`
+      );
+      if (body) L("NET", `  Body: ${body.substring(0, 300)}`);
     }
   });
 
-  // Check saved session first
-  if (fs.existsSync(C.storagePath)) {
-    L("INFO", "Testing saved session...");
-    try {
-      await page.goto(`${C.baseUrl}/${C.workspace}/product-preview`, {
-        waitUntil: "domcontentloaded",
-        timeout: 20000,
-      });
-      await sleep(3000);
-      if (hn(page) === "brokers.mktlab.app") {
-        const t = await page
-          .evaluate(() => document.body.innerText)
-          .catch(() => "");
-        if (
-          !t.includes("Acesse sua conta") &&
-          !t.includes("Acessar Lead Brokers")
-        ) {
-          L("OK", "Session valid!");
-          return;
-        }
-      }
-    } catch {}
-    try {
-      fs.unlinkSync(C.storagePath);
-    } catch {}
-  }
-
-  // ── STEP 1: Navigate to brokers signin ──────────────────────────────────
-  L("INFO", "STEP 1: brokers.mktlab.app/signin");
+  // ── STEP 1: Navigate to brokers.mktlab.app/signin ───────────────────
+  L("INFO", "STEP 1: Navigating to brokers.mktlab.app/signin...");
   await page.goto(`${C.baseUrl}/signin`, {
     waitUntil: "networkidle",
     timeout: C.timeout,
@@ -235,8 +215,8 @@ async function doLogin(page) {
     );
     L("OK", "Redirected to identity.mktlab.app");
   } catch {
-    L("WARN", `After click - still on ${hn(page)}, waiting...`);
-    await sleep(3000);
+    L("WARN", `After click - Host: ${hn(page)}, waiting...`);
+    await sleep(5000);
   }
   await sleep(2000);
   L("INFO", `After step 1 - Host: ${hn(page)}`);
@@ -246,52 +226,41 @@ async function doLogin(page) {
     throw new Error(`Expected identity.mktlab.app but got ${hn(page)}`);
   }
 
-  // ── STEP 2: Fill email ──────────────────────────────────────────────────
+  // ── STEP 2: Fill email and click Avançar ────────────────────────────
   L("INFO", "STEP 2: Filling email...");
   await debugElements(page);
 
-  const emailSelectors = [
+  // Find email field
+  const emailSel = [
     'input[name="email"]',
     'input[type="email"]',
     'input.v4-input-field[type="email"]',
     'input[placeholder*="mail"]',
-    'input[placeholder*="E-mail"]',
   ];
 
-  let emailFilled = false;
-  for (const sel of emailSelectors) {
-    const visible = await page
-      .locator(sel)
-      .first()
-      .isVisible({ timeout: 2000 })
-      .catch(() => false);
-    if (visible) {
-      L("DBG", `Using email selector: "${sel}"`);
-      emailFilled = await smartType(page, sel, C.email);
+  let emailDone = false;
+  for (const sel of emailSel) {
+    if (
+      await page
+        .locator(sel)
+        .first()
+        .isVisible({ timeout: 2000 })
+        .catch(() => false)
+    ) {
+      L("DBG", `Email selector: "${sel}"`);
+      await smartType(page, sel, C.email);
+      emailDone = true;
       break;
     }
   }
-
-  if (!emailFilled) {
-    L("WARN", "No email selector matched. Using first visible input...");
-    const firstInput = page.locator("input:visible").first();
-    if (await firstInput.isVisible({ timeout: 3000 }).catch(() => false)) {
-      emailFilled = await smartType(page, "input:visible", C.email);
-    }
-  }
-
-  if (!emailFilled) {
-    throw new Error("Could not fill email field");
-  }
+  if (!emailDone) throw new Error("Email field not found");
 
   L("OK", `Email typed: ${C.email}`);
   await snap(page, "03_email");
 
-  // ── Click Avançar ───────────────────────────────────────────────────────
-  L("INFO", "Waiting for 'Avançar' to become enabled...");
-  const avancar = page.getByText("Avançar").first();
+  // Wait for Avançar to be enabled
+  L("INFO", "Waiting for Avançar...");
   try {
-    await avancar.waitFor({ state: "visible", timeout: 5000 });
     await page.waitForFunction(
       () => {
         const btn = [...document.querySelectorAll("button")].find((b) =>
@@ -301,16 +270,17 @@ async function doLogin(page) {
       },
       { timeout: 5000 }
     );
-    L("OK", "Avançar button enabled");
+    L("OK", "Avançar enabled");
   } catch {
-    L("WARN", "Avançar not enabled after 5s, trying anyway...");
+    L("WARN", "Avançar not enabled, trying anyway...");
   }
 
+  const avancar = page.getByText("Avançar").first();
   L("INFO", "Clicking 'Avançar'...");
   await avancar.click();
 
-  // Wait for password field (SPA content swap)
-  L("INFO", "Waiting for password field...");
+  // ── STEP 3: Fill password and click Entrar ──────────────────────────
+  L("INFO", "STEP 3: Waiting for password field...");
   const pwField = page
     .locator('input[type="password"], input[name="password"]')
     .first();
@@ -324,30 +294,19 @@ async function doLogin(page) {
   }
   await sleep(500);
   await snap(page, "04_password_page");
-
-  // ── STEP 3: Fill password ───────────────────────────────────────────────
-  L("INFO", "STEP 3: Filling password...");
   await debugElements(page);
 
+  L("INFO", "Filling password...");
   await smartType(
     page,
     'input[name="password"], input[type="password"]',
     C.password
   );
   L("OK", "Password typed.");
-  await snap(page, "05_password");
+  await snap(page, "05_password_filled");
 
-  // ── STEP 4: Submit login ──────────────────────────────────────────────
-  L("INFO", "STEP 4: Submitting login...");
-
-  // Wait for Entrar button to be enabled
-  const entrar = page.getByText("Entrar", { exact: true }).first();
-  const entrarVisible = await entrar
-    .isVisible({ timeout: 3000 })
-    .catch(() => false);
-  L("DBG", `Entrar visible: ${entrarVisible}`);
-
-  // Wait for enabled state
+  // Wait for Entrar to be enabled
+  L("INFO", "Waiting for Entrar to be enabled...");
   let entrarEnabled = false;
   try {
     await page.waitForFunction(
@@ -360,20 +319,25 @@ async function doLogin(page) {
       { timeout: 5000 }
     );
     entrarEnabled = true;
-    L("OK", "Entrar button enabled");
+    L("OK", "Entrar enabled");
   } catch {
-    L("WARN", "Entrar button still disabled after 5s");
+    L("WARN", "Entrar still disabled after 5s");
   }
 
   // Log button states after typing
   await debugElements(page);
 
+  const entrar = page.getByText("Entrar", { exact: true }).first();
+  const entrarVisible = await entrar
+    .isVisible({ timeout: 3000 })
+    .catch(() => false);
+
   if (entrarVisible && entrarEnabled) {
     L("INFO", "Clicking 'Entrar'...");
     await entrar.click();
   } else if (entrarVisible) {
-    // Button visible but disabled - force enable and click
-    L("WARN", "Entrar disabled - force enabling via JS...");
+    // Button visible but disabled - force enable via JS and click
+    L("WARN", "Entrar disabled - force enabling and clicking...");
     await page.evaluate(() => {
       const btn = [...document.querySelectorAll("button")].find(
         (b) => b.textContent.trim() === "Entrar"
@@ -388,7 +352,7 @@ async function doLogin(page) {
     await pwField.press("Enter");
   }
 
-  // Wait for redirect
+  // Wait for redirect away from identity.mktlab.app
   L("INFO", "Waiting for redirect after login...");
   try {
     await page.waitForURL(
@@ -397,33 +361,30 @@ async function doLogin(page) {
     );
     L("OK", `Redirected to: ${hn(page)}`);
   } catch {
-    L("WARN", `Still on identity after 30s. Host: ${hn(page)}`);
+    L("WARN", `Still on identity after 30s`);
   }
 
   await sleep(3000);
-  L("INFO", `After login - Host: ${hn(page)} URL: ${page.url()}`);
-  L("INFO", `Signin intercepted: ${signinIntercepted}`);
+  L("INFO", `After login - Host: ${hn(page)} | Intercepted: ${signinIntercepted}`);
   await snap(page, "06_after_login");
 
-  // If still on identity, check what happened
+  // If still on identity, one more try with Enter
   if (hn(page) === "identity.mktlab.app") {
     L("WARN", "Still on identity! Checking errors...");
+    const errors = await page
+      .evaluate(() =>
+        [
+          ...document.querySelectorAll(
+            '[class*="error"],[role="alert"],[class*="toast"]'
+          ),
+        ]
+          .map((e) => e.textContent.trim())
+          .filter((t) => t)
+      )
+      .catch(() => []);
+    if (errors.length) L("ERR", `Page errors: ${errors.join(" | ")}`);
 
-    const errors = await page.evaluate(() => {
-      return [
-        ...document.querySelectorAll(
-          '[class*="error"],[role="alert"],[class*="alert"],[class*="invalid"],[class*="toast"]'
-        ),
-      ]
-        .map((e) => e.textContent.trim())
-        .filter((t) => t);
-    });
-    if (errors.length) {
-      L("ERR", `Page errors: ${errors.join(" | ")}`);
-    }
-
-    // Try one more time: press Enter on password field
-    L("INFO", "Retrying with Enter key...");
+    // Retry Enter
     try {
       if (await pwField.isVisible().catch(() => false)) {
         await pwField.focus();
@@ -437,9 +398,7 @@ async function doLogin(page) {
           L("OK", `Redirected after Enter: ${hn(page)}`);
         } catch {}
       }
-    } catch (e) {
-      L("WARN", `Enter retry failed: ${e.message}`);
-    }
+    } catch {}
   }
 
   // Final check
@@ -447,92 +406,91 @@ async function doLogin(page) {
   await snap(page, "07_final");
 
   if (hn(page) === "identity.mktlab.app") {
-    // Save debug info
+    // Save debug
     try {
-      const html = await page.content().catch(() => "");
-      fs.writeFileSync(path.join(C.outputDir, `fail_${stamp()}.html`), html);
-      const txt = await page
-        .evaluate(() => document.body.innerText)
-        .catch(() => "");
       fs.writeFileSync(
-        path.join(C.outputDir, `fail_text_${stamp()}.txt`),
-        txt
+        path.join(C.outputDir, `fail_${stamp()}.html`),
+        await page.content()
       );
     } catch {}
-
     L("ERR", "=== LOGIN FAILED ===");
-    L("ERR", `Signin API intercepted: ${signinIntercepted}`);
+    L("ERR", `Route intercepted: ${signinIntercepted}`);
     throw new Error("Login failed - stuck on identity.mktlab.app");
   }
 
   L("OK", "=== LOGIN SUCCESS ===");
-
-  // Remove route interceptor
+  // Remove route interceptor after login
   await page.unroute("**/auth/signin");
-
-  try {
-    await page.context().storageState({ path: C.storagePath });
-    L("OK", "Session saved.");
-  } catch {}
 }
 
 async function debugElements(page) {
-  const inputs = await page.locator("input:visible").all();
-  for (let i = 0; i < inputs.length; i++) {
-    const attrs = await inputs[i].evaluate((el) => ({
-      type: el.type,
-      name: el.name,
-      id: el.id,
-      placeholder: el.placeholder,
-      disabled: el.disabled,
-      value: el.value ? `[${el.value.length} chars]` : "[empty]",
-    }));
-    L("DBG", `  input[${i}]: ${JSON.stringify(attrs)}`);
-  }
-  const buttons = await page.locator("button:visible").all();
-  for (let i = 0; i < buttons.length; i++) {
-    const info = await buttons[i].evaluate((el) => ({
-      type: el.type,
-      text: el.textContent.trim().substring(0, 30),
-      disabled: el.disabled,
-    }));
-    L("DBG", `  button[${i}]: ${JSON.stringify(info)}`);
+  try {
+    const inputs = await page.locator("input:visible").all();
+    for (let i = 0; i < inputs.length; i++) {
+      const a = await inputs[i].evaluate((el) => ({
+        type: el.type,
+        name: el.name,
+        id: el.id,
+        placeholder: el.placeholder,
+        disabled: el.disabled,
+        value: el.value ? `[${el.value.length}ch]` : "[empty]",
+      }));
+      L("DBG", `  input[${i}]: ${JSON.stringify(a)}`);
+    }
+    const buttons = await page.locator("button:visible").all();
+    for (let i = 0; i < buttons.length; i++) {
+      const b = await buttons[i].evaluate((el) => ({
+        type: el.type,
+        text: el.textContent.trim().substring(0, 30),
+        disabled: el.disabled,
+      }));
+      L("DBG", `  btn[${i}]: ${JSON.stringify(b)}`);
+    }
+  } catch (e) {
+    L("WARN", `debugElements: ${e.message}`);
   }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// NAVIGATE TO LEADS PAGE
+// NAVIGATE TO LEADS PAGE (only after login)
 // ═══════════════════════════════════════════════════════════════════════════════
 async function goToMeusLeads(page) {
-  const urls = [
-    `${C.baseUrl}/${C.workspace}/product-preview`,
-    `${C.baseUrl}/v4-company-ferraz-piai-&-co./product-preview`,
-  ];
-  for (const url of urls) {
-    L("INFO", `Navigating: ${url}`);
-    await page.goto(url, { waitUntil: "networkidle", timeout: C.timeout });
+  L("INFO", `Navigating to leads page: ${C.leadsUrl}`);
+  await page.goto(C.leadsUrl, {
+    waitUntil: "networkidle",
+    timeout: C.timeout,
+  });
+  await sleep(3000);
+  const t = await page
+    .evaluate(() => document.body.innerText)
+    .catch(() => "");
+
+  if (t.includes("Acesse sua conta") || t.includes("Acessar Lead Brokers")) {
+    throw new Error("Session lost - redirected to login page");
+  }
+  if (t.includes("Minhas Aquisições") || t.includes("Exportar")) {
+    L("OK", "Meus Leads page loaded.");
+    await snap(page, "08_meus_leads");
+    return;
+  }
+  if (t.includes("Erro inesperado")) {
+    L("WARN", "Wrong workspace page. Trying alternate URL...");
+    await page.goto(
+      `${C.baseUrl}/v4-company-ferraz-piai-&-co./product-preview`,
+      { waitUntil: "networkidle", timeout: C.timeout }
+    );
     await sleep(3000);
-    const t = await page
+    const t2 = await page
       .evaluate(() => document.body.innerText)
       .catch(() => "");
-    if (t.includes("Acesse sua conta")) {
-      try {
-        fs.unlinkSync(C.storagePath);
-      } catch {}
-      throw new Error("Session lost - redirected to login");
-    }
-    if (t.includes("Minhas Aquisições") || t.includes("Exportar")) {
-      L("OK", "Meus Leads page loaded.");
+    if (t2.includes("Minhas Aquisições") || t2.includes("Exportar")) {
+      L("OK", "Meus Leads page loaded (alternate URL).");
       await snap(page, "08_meus_leads");
       return;
     }
-    if (t.includes("Erro inesperado")) {
-      L("WARN", "Wrong workspace, trying next URL...");
-      continue;
-    }
-    L("WARN", `Unknown page content: ${t.substring(0, 150)}`);
   }
-  throw new Error("Could not navigate to Meus Leads page");
+  L("WARN", `Page content: ${t.substring(0, 200)}`);
+  throw new Error("Could not load Meus Leads page");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -541,7 +499,7 @@ async function goToMeusLeads(page) {
 async function exportData(page) {
   fs.mkdirSync(C.outputDir, { recursive: true });
 
-  // Click Aquisições tab if present
+  // Click Aquisições tab
   try {
     const tab = page.locator('button:has-text("Aquisições")').first();
     if (await tab.isVisible({ timeout: 3000 })) {
@@ -550,14 +508,13 @@ async function exportData(page) {
     }
   } catch {}
 
-  // Try CSV export via download
   const exp = page
     .locator('button:has-text("Exportar"), a:has-text("Exportar")')
     .first();
   if (await exp.isVisible({ timeout: 5000 }).catch(() => false)) {
     L("INFO", "Clicking 'Exportar'...");
 
-    // Method 1: Wait for download event
+    // Method 1: Download event
     try {
       const [dl] = await Promise.all([
         page.waitForEvent("download", { timeout: 30000 }),
@@ -571,7 +528,7 @@ async function exportData(page) {
       L("WARN", `Download failed: ${e.message}`);
     }
 
-    // Method 2: Intercept network response
+    // Method 2: Network intercept
     try {
       const [resp] = await Promise.all([
         page.waitForResponse(
@@ -592,11 +549,9 @@ async function exportData(page) {
     }
   }
 
-  // Method 3: Scrape table HTML
-  L("INFO", "Falling back to table scraping...");
+  // Method 3: Table scraping
+  L("INFO", "Scraping table...");
   await page.waitForSelector("table", { timeout: 10000 }).catch(() => {});
-
-  // Scroll to load all rows
   for (let i = 0; i < 20; i++) {
     const h = await page.evaluate(() => document.body.scrollHeight);
     await page.evaluate(() =>
@@ -614,8 +569,8 @@ async function exportData(page) {
     );
     return [...t.querySelectorAll("tbody tr")]
       .map((r) => {
-        const c = [...r.querySelectorAll("td")].map((c) =>
-          c.textContent.trim()
+        const c = [...r.querySelectorAll("td")].map((td) =>
+          td.textContent.trim()
         );
         const o = {};
         ths.forEach((h, i) => (o[h] = c[i] || ""));
@@ -623,7 +578,7 @@ async function exportData(page) {
       })
       .filter((r) => Object.values(r).some((v) => v));
   });
-  L("INFO", `Table scraped: ${data.length} rows`);
+  L("INFO", `Table: ${data.length} rows`);
   return { method: "table", file: null, rows: data };
 }
 
@@ -649,17 +604,16 @@ function processResults(result) {
 }
 
 /**
- * Maps CSV/table columns to webhook field names.
- * Based on actual CSV headers from the platform:
- * Nome do Produto;Valor;Arrematador;Data;Faturamento;Segmento;Canal;
- * Nome do responsável;E-mail;Cargo;Telefone;Nome da empresa;País;
- * Documento da empresa;Tipo de produto;Urgência;Data de criação;
- * Descrição;Cidade;Estado;Data de aquisição
+ * Maps CSV columns to webhook fields.
+ * CSV headers: Nome do Produto;Valor;Arrematador;Data;Faturamento;Segmento;
+ * Canal;Nome do responsável;E-mail;Cargo;Telefone;Nome da empresa;País;
+ * Documento da empresa;Tipo de produto;Urgência;Data de criação;Descrição;
+ * Cidade;Estado;Data de aquisição
  */
 function normalizeFields(r) {
   return {
     nome_empresa: fc(r, ["nome da empresa", "empresa"]),
-    documento_empresa: fc(r, ["documento da empresa", "cnpj", "documento"]),
+    documento_empresa: fc(r, ["documento da empresa", "cnpj"]),
     faturamento: fc(r, ["faturamento"]),
     segmento: fc(r, ["segmento"]),
     pais: fc(r, ["país", "pais"]),
@@ -671,13 +625,13 @@ function normalizeFields(r) {
     descricao: fc(r, ["descrição", "descricao"]),
     data_criacao: fc(r, ["data de criação", "data de criacao"]),
     urgencia: fc(r, ["urgência", "urgencia"]),
-    city: fc(r, ["cidade", "city"]),
-    state: fc(r, ["estado", "state"]),
+    city: fc(r, ["cidade"]),
+    state: fc(r, ["estado"]),
     valor: fc(r, ["valor"]),
-    responsavel: fc(r, ["nome do responsável", "responsável", "responsavel"]),
+    responsavel: fc(r, ["nome do responsável", "responsável"]),
     arrematador: fc(r, ["arrematador"]),
-    data_compra: fc(r, ["data/hora de compra", "data/hora da compra", "data"]),
-    data_aquisicao: fc(r, ["data de aquisição", "data de aquisicao"]),
+    data_compra: fc(r, ["data/hora de compra", "data"]),
+    data_aquisicao: fc(r, ["data de aquisição"]),
     nome_produto: fc(r, ["nome do produto"]),
   };
 }
@@ -714,13 +668,13 @@ function parseCsvLine(line, sep) {
 // ═══════════════════════════════════════════════════════════════════════════════
 async function webhook(leads) {
   if (!C.webhookUrl || !leads.length) return;
-  L("INFO", `Sending ${leads.length} leads to webhook...`);
+  L("INFO", `Sending ${leads.length} leads to webhook: ${C.webhookUrl}`);
   const r = await fetch(C.webhookUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       timestamp: new Date().toISOString(),
-      source: "brokers-v7",
+      source: "brokers-v8",
       total: leads.length,
       leads,
     }),
@@ -734,16 +688,9 @@ async function webhook(leads) {
 // ═══════════════════════════════════════════════════════════════════════════════
 async function scrape() {
   if (!C.email || !C.password)
-    throw new Error("BROKER_EMAIL and BROKER_PASSWORD are required.");
+    throw new Error("BROKER_EMAIL and BROKER_PASSWORD required.");
   let browser;
   try {
-    const opts = {
-      viewport: { width: 1440, height: 900 },
-      acceptDownloads: true,
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    };
-    if (fs.existsSync(C.storagePath)) opts.storageState = C.storagePath;
     browser = await chromium.launch({
       headless: C.headless,
       args: [
@@ -753,19 +700,28 @@ async function scrape() {
         "--disable-blink-features=AutomationControlled",
       ],
     });
-    const ctx = await browser.newContext(opts);
+    const ctx = await browser.newContext({
+      viewport: { width: 1440, height: 900 },
+      acceptDownloads: true,
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    });
     await ctx.addInitScript(() => {
       Object.defineProperty(navigator, "webdriver", { get: () => undefined });
     });
     const page = await ctx.newPage();
     page.setDefaultTimeout(C.timeout);
     page.on("console", (m) => {
-      if (m.type() === "error") L("BROWSER", `${m.type()}: ${m.text()}`);
+      if (m.type() === "error") L("BROWSER", `error: ${m.text()}`);
     });
-    page.on("pageerror", (e) => L("BROWSER_ERR", e.message));
 
+    // STEP 1-3: Full login flow (always, no session shortcut)
     await doLogin(page);
+
+    // STEP 4: Navigate to leads page (only after successful login)
     await goToMeusLeads(page);
+
+    // STEP 5: Export data
     const result = await exportData(page);
     const leads = processResults(result);
     L("INFO", `Processed ${leads.length} leads (${result.method}).`);
@@ -773,16 +729,17 @@ async function scrape() {
     if (leads.length > 0) {
       const jp = path.join(C.outputDir, `leads_${stamp()}.json`);
       fs.writeFileSync(jp, JSON.stringify(leads, null, 2));
-      L("OK", `JSON saved: ${jp}`);
+      L("OK", `JSON: ${jp}`);
     }
 
+    // STEP 6: Send to webhook
     const valid = leads.filter(
       (l) => l.nome_empresa || l.telefone || l.email_responsavel
     );
     if (valid.length > 0) {
       await webhook(valid);
     } else {
-      L("WARN", `${leads.length} leads but none have valid data.`);
+      L("WARN", `${leads.length} leads but none valid.`);
     }
 
     await browser.close();
@@ -811,12 +768,7 @@ async function run() {
       return await scrape();
     } catch (e) {
       L("ERR", `Attempt ${i}: ${e.message}`);
-      if (i < C.retries) {
-        try {
-          fs.unlinkSync(C.storagePath);
-        } catch {}
-        await sleep(C.retryDelay);
-      }
+      if (i < C.retries) await sleep(C.retryDelay);
     }
   }
   return { ok: false, n: 0, method: "none" };
@@ -824,22 +776,17 @@ async function run() {
 
 async function main() {
   L("INFO", "╔═════════════════════════════════════════════════╗");
-  L("INFO", "║  Brokers Lead Exporter v7 — V4 Ferraz Piai     ║");
+  L("INFO", "║  Brokers Lead Exporter v8 — V4 Ferraz Piai     ║");
   L("INFO", "╚═════════════════════════════════════════════════╝");
-  L(
-    "INFO",
-    `Email: ${C.email} | Pass: ${"*".repeat((C.password || "").length)} chars`
-  );
-  L(
-    "INFO",
-    `Loop: ${C.interval / 60000}min | Webhook: ${C.webhookUrl ? "OK" : "NO"}`
-  );
+  L("INFO", `Email: ${C.email} | Pass: ${"*".repeat((C.password || "").length)} chars`);
+  L("INFO", `Webhook: ${C.webhookUrl ? "OK" : "NO"}`);
+  L("INFO", `Loop: ${C.interval / 60000}min`);
 
   const r = await run();
   L("INFO", `=> ${r.ok ? "OK" : "FAIL"} - ${r.n} leads (${r.method})`);
 
   setInterval(async () => {
-    L("INFO", "=================================================");
+    L("INFO", "=== CYCLE ===");
     const r = await run();
     L("INFO", `=> ${r.ok ? "OK" : "FAIL"} - ${r.n} leads (${r.method})`);
   }, C.interval);
