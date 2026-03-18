@@ -1,13 +1,16 @@
 /**
- * Brokers MKTLab - Lead Exporter v3
+ * Brokers MKTLab - Lead Exporter v4 (DEFINITIVE)
  * 
- * Login flow (3 steps, 2 domains):
- *   1. brokers.mktlab.app/signin → Click "Acessar Lead Brokers"
- *   2. identity.mktlab.app → Fill email → Click "Avançar"
- *   3. identity.mktlab.app → Fill password → Click "Entrar"
- *   4. Redirected to brokers.mktlab.app (wrong workspace) 
- *   5. Navigate directly to correct workspace URL
- *   6. Click "Meus Leads" → Export CSV or scrape table
+ * Bug fix: waitForURL regex was matching "brokers.mktlab.app" inside the
+ * identity.mktlab.app query string (?redirectTo=...brokers.mktlab.app...).
+ * This caused the script to think login succeeded when it never left identity.
+ * 
+ * Key fixes:
+ * - URL check now parses hostname, not regex on full URL string
+ * - Uses Promise.all([waitForNavigation, click]) for form submissions
+ * - Keyboard Enter as primary submit (more reliable than click)
+ * - storageState persistence to avoid re-login every hour
+ * - Proper error message detection after login attempts
  * 
  * Desenvolvido por V4 Ferraz Piai & Co.
  */
@@ -16,7 +19,6 @@ const { chromium } = require("playwright");
 const fs = require("fs");
 const path = require("path");
 
-// ─── Config ───────────────────────────────────────────────────────────────────
 const CONFIG = {
   baseUrl: process.env.BROKER_URL || "https://brokers.mktlab.app",
   email: process.env.BROKER_EMAIL,
@@ -28,608 +30,578 @@ const CONFIG = {
   retryAttempts: parseInt(process.env.RETRY_ATTEMPTS) || 3,
   retryDelayMs: parseInt(process.env.RETRY_DELAY_MS) || 5000,
   cronIntervalMs: parseInt(process.env.CRON_INTERVAL_MS) || 3600000,
-  // URL direta do workspace correto (com & literal, não %26)
-  workspaceUrl: process.env.WORKSPACE_URL || "https://brokers.mktlab.app/v4-company-ferraz-piai-&-co.",
   debug: process.env.DEBUG === "true",
+  storagePath: "/app/exports/auth-state.json",
 };
 
-// ─── Logger ───────────────────────────────────────────────────────────────────
 const log = {
-  info: (msg) => console.log(`[${ts()}] ℹ️  ${msg}`),
-  success: (msg) => console.log(`[${ts()}] ✅ ${msg}`),
-  warn: (msg) => console.warn(`[${ts()}] ⚠️  ${msg}`),
-  error: (msg) => console.error(`[${ts()}] ❌ ${msg}`),
-  debug: (msg) => { if (CONFIG.debug) console.log(`[${ts()}] 🐛 ${msg}`); },
+  info: (m) => console.log(`[${new Date().toISOString()}] ℹ️  ${m}`),
+  ok: (m) => console.log(`[${new Date().toISOString()}] ✅ ${m}`),
+  warn: (m) => console.warn(`[${new Date().toISOString()}] ⚠️  ${m}`),
+  err: (m) => console.error(`[${new Date().toISOString()}] ❌ ${m}`),
+  dbg: (m) => { if (CONFIG.debug) console.log(`[${new Date().toISOString()}] 🐛 ${m}`); },
 };
-function ts() { return new Date().toISOString(); }
-function getTimestamp() { return new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19); }
-function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
-async function screenshot(page, name) {
+const stamp = () => new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function snap(page, name) {
   if (!CONFIG.debug) return;
   try {
     fs.mkdirSync(CONFIG.outputDir, { recursive: true });
-    const p = path.join(CONFIG.outputDir, `debug_${name}_${getTimestamp()}.png`);
+    const p = path.join(CONFIG.outputDir, `debug_${name}_${stamp()}.png`);
     await page.screenshot({ path: p, fullPage: true });
-    log.debug(`Screenshot: ${p}`);
+    log.dbg(`Screenshot: ${p}`);
   } catch (_) {}
 }
 
+/** Check if current page hostname is brokers.mktlab.app (NOT in query string) */
+function isOnBrokers(page) {
+  try {
+    const url = new URL(page.url());
+    return url.hostname === "brokers.mktlab.app";
+  } catch {
+    return false;
+  }
+}
+
+/** Check if current page hostname is identity.mktlab.app */
+function isOnIdentity(page) {
+  try {
+    const url = new URL(page.url());
+    return url.hostname === "identity.mktlab.app";
+  } catch {
+    return false;
+  }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
-// STEP 1: Login completo (3 etapas)
+// LOGIN — 3-step flow across 2 domains
 // ═══════════════════════════════════════════════════════════════════════════════
 async function doLogin(page) {
-  // ── Etapa 1: Acessar brokers.mktlab.app → clicar "Acessar Lead Brokers" ──
-  log.info("Etapa 1/3: Acessando brokers.mktlab.app/signin...");
-  await page.goto(`${CONFIG.baseUrl}/signin`, { waitUntil: "networkidle", timeout: CONFIG.timeout });
-  await page.waitForTimeout(3000);
-  await screenshot(page, "01_signin_page");
-
-  // Verifica se já está logado (se não caiu no /signin)
-  const currentUrl = page.url();
-  if (!currentUrl.includes("signin") && !currentUrl.includes("identity")) {
-    log.info("Parece já estar autenticado (não redirecionou para signin).");
-    return;
-  }
-
-  // Clicar no botão vermelho "Acessar Lead Brokers"
-  const accessButton = page.locator('a:has-text("Acessar Lead Brokers"), button:has-text("Acessar Lead Brokers")').first();
-  if (await accessButton.isVisible({ timeout: 5000 }).catch(() => false)) {
-    log.info("Clicando em 'Acessar Lead Brokers'...");
-    await accessButton.click();
-  } else {
-    // Talvez já esteja na página de login do identity
-    log.info("Botão 'Acessar Lead Brokers' não encontrado — pode já estar no identity.");
-  }
-
-  // Espera redirecionar para identity.mktlab.app
-  await page.waitForLoadState("networkidle", { timeout: CONFIG.timeout }).catch(() => {});
-  await page.waitForTimeout(3000);
-  await screenshot(page, "02_identity_page");
-
-  // ── Etapa 2: Preencher email → clicar "Avançar" ──────────────────────────
-  log.info("Etapa 2/3: Preenchendo email...");
-  
-  // Espera o campo de email aparecer
-  const emailInput = page.locator('input[type="email"], input[name="email"], input[placeholder*="mail"], input[autocomplete="email"]').first();
-  try {
-    await emailInput.waitFor({ state: "visible", timeout: 10000 });
-    await emailInput.fill(CONFIG.email);
-    log.success(`Email preenchido: ${CONFIG.email}`);
-    await page.waitForTimeout(500);
-    await screenshot(page, "03_email_filled");
-
-    // Clicar "Avançar"
-    const avancarBtn = page.locator('button:has-text("Avançar"), button:has-text("Avancar"), button:has-text("Next"), button[type="submit"]').first();
-    await avancarBtn.waitFor({ state: "visible", timeout: 5000 });
-    await avancarBtn.click();
-    log.info("Clicou em 'Avançar'.");
-  } catch (e) {
-    // Pode ser que email e senha estejam na mesma página
-    log.warn(`Campo de email ou botão Avançar não encontrado: ${e.message}`);
-    log.info("Tentando preencher email e senha na mesma página...");
-  }
-
-  // Espera a senha aparecer
-  await page.waitForTimeout(3000);
-  await screenshot(page, "04_password_page");
-
-  // ── Etapa 3: Preencher senha → clicar "Entrar" ───────────────────────────
-  log.info("Etapa 3/3: Preenchendo senha...");
-
-  const passwordInput = page.locator('input[type="password"]').first();
-  try {
-    await passwordInput.waitFor({ state: "visible", timeout: 10000 });
-    await passwordInput.fill(CONFIG.password);
-    log.success("Senha preenchida.");
-    await page.waitForTimeout(500);
-    await screenshot(page, "05_password_filled");
-
-    // Clicar "Entrar"
-    const entrarBtn = page.locator('button:has-text("Entrar"), button:has-text("Login"), button:has-text("Sign in"), button[type="submit"]').first();
-    await entrarBtn.waitFor({ state: "visible", timeout: 5000 });
-    await entrarBtn.click();
-    log.info("Clicou em 'Entrar'.");
-  } catch (e) {
-    log.error(`Erro ao preencher senha: ${e.message}`);
-    throw new Error("Falha no login: campo de senha não encontrado.");
-  }
-
-  // Espera redirecionamento de volta para brokers.mktlab.app
-  log.info("Aguardando redirecionamento pós-login...");
-  try {
-    await page.waitForURL(/brokers\.mktlab\.app/, { timeout: 30000 });
-  } catch (_) {
-    // Pode ter ficado no identity — tenta esperar mais
-    await page.waitForTimeout(5000);
-  }
-  await page.waitForLoadState("networkidle").catch(() => {});
-  await page.waitForTimeout(3000);
-  await screenshot(page, "06_after_login");
-
-  const postLoginUrl = page.url();
-  log.success(`Login concluído. URL atual: ${postLoginUrl}`);
-
-  // Verifica se o login realmente funcionou
-  const bodyText = await page.evaluate(() => document.body.innerText).catch(() => "");
-  if (bodyText.includes("Acesse sua conta") || bodyText.includes("Acessar Lead Brokers")) {
-    throw new Error("Login falhou — ainda na página de login.");
-  }
-
-  log.success("Login verificado com sucesso!");
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// STEP 2: Navegar para workspace correto via URL direta
-// ═══════════════════════════════════════════════════════════════════════════════
-async function navigateToWorkspace(page) {
-  log.info(`Navegando direto para workspace: ${CONFIG.workspaceUrl}`);
-  await page.goto(CONFIG.workspaceUrl, { waitUntil: "networkidle", timeout: CONFIG.timeout });
-  await page.waitForTimeout(3000);
-  await screenshot(page, "07_workspace");
-
-  // Verifica se caiu no workspace certo (deve ter cards de leads ou menu)
-  const bodyText = await page.evaluate(() => document.body.innerText).catch(() => "");
-  if (bodyText.includes("Erro inesperado")) {
-    log.error("Workspace mostra 'Erro inesperado'. Pode não ter autenticado corretamente.");
-    throw new Error("Workspace com erro inesperado.");
-  }
-
-  const currentUrl = page.url();
-  log.success(`No workspace correto. URL: ${currentUrl}`);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// STEP 3: Navegar para "Meus Leads"
-// ═══════════════════════════════════════════════════════════════════════════════
-async function navigateToMeusLeads(page) {
-  log.info("Navegando para Meus Leads...");
-
-  // Tenta clicar no link do sidebar (ícone de carrinho de compras)
-  const selectors = [
-    'a:has-text("Meus Leads")',
-    'text=Meus Leads',
-    '[href*="product-preview"]',
-    // Ícone no sidebar — baseado no screenshot, é o 4º ícone
-    'nav a[href*="product"]',
-    'aside a[href*="product"]',
-  ];
-
-  for (const sel of selectors) {
+  // Check if we have a saved session
+  if (fs.existsSync(CONFIG.storagePath)) {
+    log.info("Sessão salva encontrada. Testando validade...");
     try {
-      const link = page.locator(sel).first();
-      if (await link.isVisible({ timeout: 3000 })) {
-        await link.click();
-        await page.waitForLoadState("networkidle").catch(() => {});
-        await page.waitForTimeout(3000);
-        await screenshot(page, "08_meus_leads_via_menu");
-
-        // Verificar se chegou na página certa
-        const url = page.url();
+      // Try loading the workspace directly to check if session is valid
+      await page.goto(`${CONFIG.baseUrl}/v4-company-ferraz-piai-%26-co./product-preview`, {
+        waitUntil: "domcontentloaded",
+        timeout: 20000,
+      });
+      await page.waitForTimeout(3000);
+      
+      if (isOnBrokers(page)) {
         const text = await page.evaluate(() => document.body.innerText).catch(() => "");
-        if (url.includes("product-preview") || text.includes("Minhas Aquisições") || text.includes("Exportar")) {
-          log.success("Página Meus Leads carregada via menu.");
+        if (!text.includes("Acesse sua conta") && !text.includes("Acessar Lead Brokers")) {
+          log.ok("Sessão ainda válida! Pulando login.");
           return;
         }
       }
-    } catch (_) {}
+      log.info("Sessão expirada. Fazendo login novo...");
+    } catch {
+      log.info("Erro ao testar sessão. Fazendo login novo...");
+    }
   }
 
-  // Fallback: URL direta
-  log.info("Menu não encontrado, tentando URL direta...");
-  const meusLeadsUrl = CONFIG.workspaceUrl.replace(/\/?$/, "") + "/product-preview";
-  log.debug(`URL Meus Leads: ${meusLeadsUrl}`);
-  await page.goto(meusLeadsUrl, { waitUntil: "networkidle", timeout: CONFIG.timeout });
-  await page.waitForTimeout(3000);
-  await screenshot(page, "08_meus_leads_direct");
+  // ── STEP 1: brokers.mktlab.app/signin → Click "Acessar Lead Brokers" ─────
+  log.info("LOGIN 1/3: Acessando página de signin...");
+  await page.goto(`${CONFIG.baseUrl}/signin`, {
+    waitUntil: "networkidle",
+    timeout: CONFIG.timeout,
+  });
+  await page.waitForTimeout(2000);
+  await snap(page, "01_signin");
 
-  // Verificar se está na página correta
-  const bodyText = await page.evaluate(() => document.body.innerText).catch(() => "");
-  if (bodyText.includes("Acesse sua conta") || bodyText.includes("Acessar Lead Brokers")) {
-    throw new Error("Redirecionado para login — sessão perdida.");
-  }
-
-  if (bodyText.includes("Minhas Aquisições") || bodyText.includes("Exportar")) {
-    log.success("Página Meus Leads carregada via URL direta.");
+  // Click the red "Acessar Lead Brokers" button
+  const accessBtn = page.locator('a:has-text("Acessar Lead Brokers"), button:has-text("Acessar Lead Brokers")').first();
+  if (await accessBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
+    log.info("Clicando 'Acessar Lead Brokers'...");
+    // This navigates to identity.mktlab.app
+    await Promise.all([
+      page.waitForURL((url) => new URL(url).hostname === "identity.mktlab.app", { timeout: 15000 }).catch(() => {}),
+      accessBtn.click(),
+    ]);
+  } else if (isOnIdentity(page)) {
+    log.info("Já no identity.mktlab.app.");
   } else {
-    log.warn("Não tenho certeza se estamos na página correta. Continuando...");
-    await screenshot(page, "08_meus_leads_uncertain");
+    // Navigate directly to identity
+    log.info("Botão não encontrado. Acessando identity diretamente...");
+    await page.goto(`${CONFIG.baseUrl}/signin`, { waitUntil: "networkidle", timeout: CONFIG.timeout });
+  }
+
+  await page.waitForTimeout(2000);
+  await snap(page, "02_identity");
+
+  // ── STEP 2: identity.mktlab.app → Fill email → Click "Avançar" ───────────
+  log.info("LOGIN 2/3: Preenchendo email...");
+  
+  // Wait for email input to appear
+  const emailInput = page.locator('input[type="email"], input[name="email"]').first();
+  await emailInput.waitFor({ state: "visible", timeout: 10000 });
+  
+  // Clear and fill email
+  await emailInput.click();
+  await emailInput.fill("");
+  await emailInput.fill(CONFIG.email);
+  await page.waitForTimeout(500);
+  log.ok(`Email: ${CONFIG.email}`);
+  await snap(page, "03_email");
+
+  // Click "Avançar" and wait for password field to appear
+  const avancarBtn = page.locator('button:has-text("Avançar")').first();
+  if (await avancarBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+    await avancarBtn.click();
+    log.info("Clicou 'Avançar'. Aguardando campo de senha...");
+  } else {
+    // Maybe email and password are on the same page
+    log.info("Botão 'Avançar' não encontrado — pode ser formulário single-page.");
+  }
+
+  // Wait for password field to appear (it may take a moment after "Avançar")
+  const passwordInput = page.locator('input[type="password"]').first();
+  await passwordInput.waitFor({ state: "visible", timeout: 15000 });
+  await page.waitForTimeout(1000); // Extra wait for page to stabilize
+  await snap(page, "04_password_page");
+
+  // ── STEP 3: Fill password → Press Enter (more reliable than clicking) ─────
+  log.info("LOGIN 3/3: Preenchendo senha e submetendo...");
+  
+  await passwordInput.click();
+  await passwordInput.fill("");
+  await passwordInput.fill(CONFIG.password);
+  await page.waitForTimeout(500);
+  log.ok("Senha preenchida.");
+  await snap(page, "05_password_filled");
+
+  // Check for error messages BEFORE submitting (e.g., "email inválido")
+  const preErrors = await page.evaluate(() => {
+    const errorEls = document.querySelectorAll('[class*="error"], [class*="alert"], [role="alert"]');
+    return Array.from(errorEls).map(e => e.textContent.trim()).filter(t => t.length > 0);
+  });
+  if (preErrors.length > 0) {
+    log.warn(`Erros pré-submit: ${preErrors.join(" | ")}`);
+  }
+
+  // Submit using KEYBOARD ENTER (more reliable than clicking for SPA forms)
+  // Start listening for navigation BEFORE pressing Enter
+  log.info("Submetendo formulário (Enter)...");
+  
+  const navigationPromise = page.waitForURL(
+    (url) => new URL(url).hostname === "brokers.mktlab.app",
+    { timeout: 30000 }
+  ).catch(() => null);
+
+  // Try Enter key first
+  await passwordInput.press("Enter");
+  
+  // Wait a moment to see if Enter worked
+  await page.waitForTimeout(2000);
+  
+  // If still on identity, try clicking the "Entrar" button
+  if (isOnIdentity(page)) {
+    log.info("Enter não navegou. Tentando clicar 'Entrar'...");
+    const entrarBtn = page.locator('button:has-text("Entrar")').first();
+    if (await entrarBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+      await entrarBtn.click();
+    }
+  }
+
+  // Wait for the full OAuth redirect chain: identity → brokers/auth/token → brokers
+  log.info("Aguardando redirect OAuth (até 30s)...");
+  await navigationPromise;
+  
+  // Extra safety wait for the redirect chain to fully complete
+  await page.waitForLoadState("networkidle").catch(() => {});
+  await page.waitForTimeout(3000);
+  await snap(page, "06_after_login");
+
+  // ── VERIFY LOGIN SUCCESS ──────────────────────────────────────────────────
+  const currentUrl = page.url();
+  log.info(`URL pós-login: ${currentUrl}`);
+
+  if (isOnIdentity(page)) {
+    // Still on identity — login failed
+    // Check for error messages
+    const errors = await page.evaluate(() => {
+      const errorEls = document.querySelectorAll('[class*="error"], [class*="alert"], [role="alert"], [class*="message"]');
+      return Array.from(errorEls).map(e => e.textContent.trim()).filter(t => t.length > 0);
+    });
+    
+    if (errors.length > 0) {
+      log.err(`Erros na página de login: ${errors.join(" | ")}`);
+    }
+    
+    // Dump page content for debugging
+    const pageText = await page.evaluate(() => document.body.innerText).catch(() => "");
+    const debugPath = path.join(CONFIG.outputDir, `login_fail_text_${stamp()}.txt`);
+    fs.writeFileSync(debugPath, `URL: ${currentUrl}\n\nBody:\n${pageText}`, "utf-8");
+    log.info(`Texto da página salvo: ${debugPath}`);
+    
+    throw new Error(`Login falhou. Ainda em identity.mktlab.app. Verifique credenciais e screenshots.`);
+  }
+
+  if (!isOnBrokers(page)) {
+    throw new Error(`Login redirecionou para URL inesperada: ${currentUrl}`);
+  }
+
+  log.ok("Login OK! Estamos em brokers.mktlab.app");
+
+  // Save session state for reuse
+  try {
+    await page.context().storageState({ path: CONFIG.storagePath });
+    log.ok("Sessão salva para reutilização.");
+  } catch (e) {
+    log.warn(`Não conseguiu salvar sessão: ${e.message}`);
   }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// STEP 4: Exportar dados (CSV ou scrape da tabela)
+// NAVIGATE TO "MEUS LEADS"
+// ═══════════════════════════════════════════════════════════════════════════════
+async function goToMeusLeads(page) {
+  // Navigate to workspace + Meus Leads in one step via URL
+  const meusLeadsUrl = `${CONFIG.baseUrl}/v4-company-ferraz-piai-%26-co./product-preview`;
+  log.info(`Navegando para Meus Leads: ${meusLeadsUrl}`);
+  
+  await page.goto(meusLeadsUrl, { waitUntil: "networkidle", timeout: CONFIG.timeout });
+  await page.waitForTimeout(3000);
+  await snap(page, "07_meus_leads");
+
+  // Verify we're on the right page
+  if (!isOnBrokers(page)) {
+    // Maybe redirected to login — session expired
+    throw new Error("Redirecionado para fora de brokers. Sessão pode ter expirado.");
+  }
+
+  const bodyText = await page.evaluate(() => document.body.innerText).catch(() => "");
+  
+  if (bodyText.includes("Acesse sua conta") || bodyText.includes("Acessar Lead Brokers")) {
+    // Delete saved session as it's invalid
+    try { fs.unlinkSync(CONFIG.storagePath); } catch {}
+    throw new Error("Sessão expirada — redirecionou para login.");
+  }
+
+  if (bodyText.includes("Erro inesperado")) {
+    // Wrong workspace — try with & instead of %26
+    log.warn("Erro inesperado. Tentando URL alternativa...");
+    await page.goto(`${CONFIG.baseUrl}/v4-company-ferraz-piai-&-co./product-preview`, {
+      waitUntil: "networkidle", timeout: CONFIG.timeout,
+    });
+    await page.waitForTimeout(3000);
+    await snap(page, "07b_meus_leads_alt");
+  }
+
+  // Check for expected content
+  const text2 = await page.evaluate(() => document.body.innerText).catch(() => "");
+  if (text2.includes("Minhas Aquisições") || text2.includes("Exportar")) {
+    log.ok("Página 'Meus Leads' confirmada.");
+  } else if (text2.includes("Erro inesperado")) {
+    throw new Error("Workspace incorreto — 'Erro inesperado' persiste.");
+  } else {
+    log.warn("Não confirmei conteúdo esperado, mas continuando...");
+    log.dbg(`Conteúdo: ${text2.substring(0, 200)}`);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXPORT DATA
 // ═══════════════════════════════════════════════════════════════════════════════
 async function exportData(page) {
-  log.info("Exportando dados...");
   fs.mkdirSync(CONFIG.outputDir, { recursive: true });
 
-  // Garantir que a aba "Aquisições" está selecionada
+  // Make sure "Aquisições" tab is selected
   try {
-    const aquisTab = page.locator('button:has-text("Aquisições"), a:has-text("Aquisições"), [role="tab"]:has-text("Aquisições")').first();
-    if (await aquisTab.isVisible({ timeout: 3000 })) {
-      await aquisTab.click();
+    const tab = page.locator('button:has-text("Aquisições"), [role="tab"]:has-text("Aquisições")').first();
+    if (await tab.isVisible({ timeout: 3000 })) {
+      await tab.click();
       await page.waitForTimeout(2000);
-      log.info("Aba 'Aquisições' selecionada.");
     }
-  } catch (_) {}
+  } catch {}
 
-  // ── Estratégia A: Botão Exportar → download de CSV ───────────────────────
+  // ── Strategy A: Click "Exportar" button ──────────────────────────────────
   const exportBtn = page.locator('button:has-text("Exportar"), a:has-text("Exportar")').first();
   if (await exportBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
-    log.info("Botão 'Exportar' encontrado. Tentando download...");
-    await screenshot(page, "09_before_export");
+    log.info("Botão 'Exportar' encontrado.");
+    await snap(page, "08_before_export");
 
+    // Attempt 1: Wait for download event
     try {
       const [download] = await Promise.all([
         page.waitForEvent("download", { timeout: 30000 }),
         exportBtn.click(),
       ]);
-      const csvPath = path.join(CONFIG.outputDir, `leads_${getTimestamp()}.csv`);
+      const csvPath = path.join(CONFIG.outputDir, `leads_${stamp()}.csv`);
       await download.saveAs(csvPath);
-      log.success(`CSV baixado: ${csvPath}`);
-      return { method: "csv", filePath: csvPath };
+      log.ok(`CSV download: ${csvPath}`);
+      return { method: "csv", file: csvPath };
     } catch (e) {
-      log.warn(`Download do CSV falhou: ${e.message}`);
-      // Pode ser que o "Exportar" dispare um fetch/XHR ao invés de download
+      log.warn(`Download falhou: ${e.message}`);
     }
 
-    // Tenta interceptar via network
+    // Attempt 2: Intercept network response
     try {
       log.info("Tentando interceptar resposta de rede...");
-      const responsePromise = page.waitForResponse(
-        (resp) => {
-          const ct = resp.headers()["content-type"] || "";
-          const url = resp.url();
-          return ct.includes("csv") || ct.includes("octet") || ct.includes("excel") ||
-                 url.includes("export") || url.includes("csv") || url.includes("download");
-        },
-        { timeout: 15000 }
-      );
-      await exportBtn.click();
-      const resp = await responsePromise;
+      const [resp] = await Promise.all([
+        page.waitForResponse(
+          (r) => {
+            const ct = r.headers()["content-type"] || "";
+            return ct.includes("csv") || ct.includes("octet") || ct.includes("spreadsheet") ||
+                   r.url().includes("export") || r.url().includes("download");
+          },
+          { timeout: 15000 }
+        ),
+        exportBtn.click(),
+      ]);
       const body = await resp.body();
-      const csvPath = path.join(CONFIG.outputDir, `leads_${getTimestamp()}.csv`);
+      const csvPath = path.join(CONFIG.outputDir, `leads_${stamp()}.csv`);
       fs.writeFileSync(csvPath, body);
-      log.success(`CSV capturado via rede: ${csvPath}`);
-      return { method: "csv_network", filePath: csvPath };
+      log.ok(`CSV interceptado: ${csvPath}`);
+      return { method: "csv_intercept", file: csvPath };
     } catch (e) {
-      log.warn(`Interceptação de rede falhou: ${e.message}`);
+      log.warn(`Interceptação falhou: ${e.message}`);
     }
   } else {
-    log.warn("Botão 'Exportar' NÃO encontrado na página.");
+    log.warn("Botão 'Exportar' NÃO encontrado.");
   }
 
-  // ── Estratégia B: Scrape da tabela HTML ──────────────────────────────────
-  log.info("Fallback: extraindo dados da tabela HTML...");
+  // ── Strategy B: Scrape HTML table ────────────────────────────────────────
+  log.info("Fallback: scraping tabela HTML...");
   return await scrapeTable(page);
 }
 
 async function scrapeTable(page) {
-  await screenshot(page, "10_table_scrape");
+  await snap(page, "09_table");
 
-  // Espera a tabela aparecer
-  try {
-    await page.waitForSelector("table", { timeout: 10000 });
-  } catch (_) {
-    log.warn("Nenhuma <table> encontrada.");
-  }
+  // Wait for table
+  await page.waitForSelector("table", { timeout: 10000 }).catch(() => {});
 
-  // Scroll para carregar todos os dados (caso tenha lazy loading)
-  let previousHeight = 0;
-  for (let i = 0; i < 10; i++) {
-    const currentHeight = await page.evaluate(() => document.body.scrollHeight);
-    if (currentHeight === previousHeight) break;
-    previousHeight = currentHeight;
+  // Scroll to load all rows
+  for (let i = 0; i < 15; i++) {
+    const h = await page.evaluate(() => document.body.scrollHeight);
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(1000);
+    const h2 = await page.evaluate(() => document.body.scrollHeight);
+    if (h2 === h) break;
   }
 
-  const leads = await page.evaluate(() => {
-    const results = [];
+  const data = await page.evaluate(() => {
     const table = document.querySelector("table");
-    if (!table) return results;
+    if (!table) return [];
 
-    // Extrai headers
-    const headerCells = table.querySelectorAll("thead th, thead td, tr:first-child th, tr:first-child td");
-    const headers = [];
-    headerCells.forEach((h) => headers.push(h.textContent.trim()));
+    const ths = Array.from(table.querySelectorAll("thead th")).map(h => h.textContent.trim());
+    const rows = Array.from(table.querySelectorAll("tbody tr"));
 
-    // Extrai rows
-    const rows = table.querySelectorAll("tbody tr");
-    rows.forEach((row) => {
-      const cells = row.querySelectorAll("td");
-      if (cells.length < 3) return;
-
-      const rowData = {};
-      cells.forEach((cell, idx) => {
-        const key = headers[idx] || `col_${idx}`;
-        rowData[key] = cell.textContent.trim();
-      });
-      results.push(rowData);
-    });
-
-    return results;
+    return rows.map(row => {
+      const cells = Array.from(row.querySelectorAll("td")).map(c => c.textContent.trim());
+      const obj = {};
+      ths.forEach((h, i) => { obj[h] = cells[i] || ""; });
+      return obj;
+    }).filter(r => Object.values(r).some(v => v.length > 0));
   });
 
-  log.info(`Tabela HTML: ${leads.length} registros extraídos.`);
-
-  if (leads.length > 0) {
-    log.debug(`Headers encontrados: ${Object.keys(leads[0]).join(", ")}`);
-    log.debug(`Primeiro registro: ${JSON.stringify(leads[0])}`);
+  log.info(`Tabela: ${data.length} linhas.`);
+  if (data.length > 0) {
+    log.dbg(`Headers: ${Object.keys(data[0]).join(", ")}`);
+    log.dbg(`Row 0: ${JSON.stringify(data[0])}`);
   }
 
-  return { method: "table_scrape", leads, filePath: null };
+  return { method: "table", file: null, rows: data };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// STEP 5: Extrair detalhes clicando em cada lead (para pegar CNPJ e Faturamento)
+// PROCESS & NORMALIZE
 // ═══════════════════════════════════════════════════════════════════════════════
-async function enrichLeadsFromDetails(page, leads) {
-  // A tabela "Meus Leads" não tem coluna de CNPJ/Faturamento/Segmento
-  // Esses campos só aparecem quando clicamos no card do lead (painel de detalhes)
-  // Se já temos os dados do CSV, pula esta etapa
-  
-  if (leads.length === 0) return leads;
-
-  // Verifica se já temos faturamento (se sim, veio do CSV completo)
-  const hasFaturamento = leads.some(l => l.faturamento && l.faturamento !== "");
-  if (hasFaturamento) {
-    log.info("Dados já contêm faturamento — pulando enriquecimento.");
-    return leads;
-  }
-
-  log.info("Tabela não tem CNPJ/Faturamento. Tentando enriquecer via detalhes dos cards...");
-  
-  // Volta para a página principal do workspace (onde tem os cards)
-  try {
-    await page.goto(CONFIG.workspaceUrl, { waitUntil: "networkidle", timeout: CONFIG.timeout });
-    await page.waitForTimeout(3000);
-  } catch (_) {
-    log.warn("Não conseguiu voltar para página de cards.");
-    return leads;
-  }
-
-  // Para cada lead, tenta clicar no card e pegar os detalhes
-  // Isso é opcional e mais lento — só faz se necessário
-  // Por ora, retorna os dados que temos
-  log.info("Enriquecimento via cards não implementado nesta versão. Use CSV se possível.");
-  return leads;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// STEP 6: Processar e normalizar dados
-// ═══════════════════════════════════════════════════════════════════════════════
-function processData(exportResult) {
-  let leads = [];
-
-  if (exportResult.filePath) {
-    // Parse CSV
-    const raw = fs.readFileSync(exportResult.filePath, "utf-8");
-    const delimiter = raw.split("\n")[0].includes(";") ? ";" : ",";
-    const lines = raw.split("\n").filter((l) => l.trim());
+function processData(result) {
+  if (result.file) {
+    const raw = fs.readFileSync(result.file, "utf-8");
+    const sep = raw.split("\n")[0]?.includes(";") ? ";" : ",";
+    const lines = raw.split("\n").filter(l => l.trim());
     if (lines.length < 2) return [];
 
-    const headers = lines[0].split(delimiter).map((h) => h.trim().replace(/^"|"$/g, ""));
-    log.debug(`CSV headers: ${headers.join(" | ")}`);
-
-    for (let i = 1; i < lines.length; i++) {
-      // Handle quoted CSV values with delimiters inside
-      const values = parseCSVLine(lines[i], delimiter);
+    const hdrs = csvParseLine(lines[0], sep);
+    return lines.slice(1).map(line => {
+      const vals = csvParseLine(line, sep);
       const row = {};
-      headers.forEach((h, idx) => { row[h] = (values[idx] || "").trim(); });
-      leads.push(mapFields(row));
-    }
-  } else if (exportResult.leads) {
-    leads = exportResult.leads.map(mapFields);
+      hdrs.forEach((h, i) => { row[h] = vals[i] || ""; });
+      return normalize(row);
+    });
   }
 
-  return leads;
+  if (result.rows) {
+    return result.rows.map(normalize);
+  }
+
+  return [];
 }
 
-function mapFields(row) {
+function normalize(row) {
   return {
-    nome_empresa: fc(row, ["empresa", "nome da empresa", "company", "nome_empresa"]),
-    cnpj: fc(row, ["documento da empresa", "cnpj", "documento", "cpf_cnpj"]),
-    faturamento: fc(row, ["faturamento", "revenue"]),
-    segmento: fc(row, ["segmento", "segment"]),
-    responsavel: fc(row, ["responsável", "responsavel", "contact"]),
+    nome_empresa: fc(row, ["empresa", "nome da empresa"]),
+    cnpj: fc(row, ["documento da empresa", "cnpj", "documento"]),
+    faturamento: fc(row, ["faturamento"]),
+    segmento: fc(row, ["segmento"]),
+    responsavel: fc(row, ["responsável", "responsavel"]),
     telefone: fc(row, ["telefone", "phone"]),
     email: fc(row, ["e-mail", "email"]),
-    valor: fc(row, ["valor", "value"]),
-    cargo: fc(row, ["cargo", "role", "position"]),
-    data_compra: fc(row, ["data/hora de compra", "data_compra", "data", "date"]),
-    tipo: fc(row, ["tipo", "type"]),
-    arrematador: fc(row, ["arrematador", "buyer"]),
+    valor: fc(row, ["valor"]),
+    cargo: fc(row, ["cargo"]),
+    tipo: fc(row, ["tipo"]),
+    arrematador: fc(row, ["arrematador"]),
+    data_compra: fc(row, ["data/hora de compra", "data_compra"]),
   };
 }
 
 function fc(row, names) {
-  const norm = (s) => s.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim();
-  for (const key of Object.keys(row)) {
+  const n = (s) => s.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim();
+  for (const k of Object.keys(row)) {
     for (const name of names) {
-      if (norm(key) === norm(name) || norm(key).includes(norm(name))) {
-        return row[key] || "";
-      }
+      if (n(k) === n(name) || n(k).includes(n(name))) return row[k] || "";
     }
   }
   return "";
 }
 
-function parseCSVLine(line, delimiter) {
-  const result = [];
-  let current = "";
-  let inQuotes = false;
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    if (ch === '"') {
-      inQuotes = !inQuotes;
-    } else if (ch === delimiter && !inQuotes) {
-      result.push(current.trim().replace(/^"|"$/g, ""));
-      current = "";
-    } else {
-      current += ch;
-    }
+function csvParseLine(line, sep) {
+  const out = [];
+  let cur = "", q = false;
+  for (const ch of line) {
+    if (ch === '"') q = !q;
+    else if (ch === sep && !q) { out.push(cur.replace(/^"|"$/g, "").trim()); cur = ""; }
+    else cur += ch;
   }
-  result.push(current.trim().replace(/^"|"$/g, ""));
-  return result;
+  out.push(cur.replace(/^"|"$/g, "").trim());
+  return out;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// STEP 7: Enviar webhook
+// WEBHOOK
 // ═══════════════════════════════════════════════════════════════════════════════
 async function sendWebhook(leads) {
-  if (!CONFIG.webhookUrl) {
-    log.info("Webhook não configurado.");
-    return;
-  }
-  if (leads.length === 0) {
-    log.warn("Nenhum lead para enviar — pulando webhook.");
-    return;
-  }
+  if (!CONFIG.webhookUrl || leads.length === 0) return;
 
-  log.info(`Enviando ${leads.length} leads para webhook...`);
-  const resp = await fetch(CONFIG.webhookUrl, {
+  log.info(`Enviando ${leads.length} leads...`);
+  const r = await fetch(CONFIG.webhookUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       timestamp: new Date().toISOString(),
-      source: "brokers-lead-exporter-v3",
+      source: "brokers-exporter-v4",
       total: leads.length,
       leads,
     }),
   });
-
-  if (!resp.ok) {
-    throw new Error(`Webhook ${resp.status}: ${await resp.text().catch(() => "")}`);
-  }
-  log.success("Webhook OK.");
+  if (!r.ok) throw new Error(`Webhook ${r.status}`);
+  log.ok("Webhook enviado.");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Main scrape flow
+// MAIN FLOW
 // ═══════════════════════════════════════════════════════════════════════════════
 async function scrape() {
-  if (!CONFIG.email || !CONFIG.password) {
-    throw new Error("BROKER_EMAIL e BROKER_PASSWORD obrigatórios.");
-  }
+  if (!CONFIG.email || !CONFIG.password) throw new Error("Credenciais obrigatórias.");
 
   let browser;
   try {
+    // Try to reuse saved session
+    const contextOptions = {
+      viewport: { width: 1440, height: 900 },
+      acceptDownloads: true,
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    };
+
+    if (fs.existsSync(CONFIG.storagePath)) {
+      contextOptions.storageState = CONFIG.storagePath;
+    }
+
     browser = await chromium.launch({
       headless: CONFIG.headless,
       args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
     });
 
-    const context = await browser.newContext({
-      viewport: { width: 1440, height: 900 },
-      acceptDownloads: true,
-      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    });
-
+    const context = await browser.newContext(contextOptions);
     const page = await context.newPage();
     page.setDefaultTimeout(CONFIG.timeout);
 
-    // Step 1: Login (3 etapas)
+    // Login (skips if session is valid)
     await doLogin(page);
 
-    // Step 2: Ir para workspace correto via URL direta
-    await navigateToWorkspace(page);
+    // Navigate to Meus Leads
+    await goToMeusLeads(page);
 
-    // Step 3: Ir para Meus Leads
-    await navigateToMeusLeads(page);
+    // Export
+    const result = await exportData(page);
 
-    // Validar que estamos na página certa
-    const bodyText = await page.evaluate(() => document.body.innerText).catch(() => "");
-    if (bodyText.includes("Acesse sua conta")) {
-      throw new Error("Sessão não autenticada — redirecionou para login.");
-    }
+    // Process
+    const leads = processData(result);
+    log.info(`${leads.length} leads (${result.method}).`);
 
-    // Step 4: Exportar
-    const exportResult = await exportData(page);
-
-    // Step 5: Processar
-    const leads = processData(exportResult);
-    log.info(`${leads.length} leads processados (${exportResult.method}).`);
-
-    // Salvar JSON
+    // Save
     if (leads.length > 0) {
-      const jsonPath = path.join(CONFIG.outputDir, `leads_${getTimestamp()}.json`);
-      fs.writeFileSync(jsonPath, JSON.stringify(leads, null, 2), "utf-8");
-      log.success(`JSON: ${jsonPath}`);
+      const jp = path.join(CONFIG.outputDir, `leads_${stamp()}.json`);
+      fs.writeFileSync(jp, JSON.stringify(leads, null, 2));
+      log.ok(`JSON: ${jp}`);
     }
 
-    // Step 6: Webhook (só envia se tiver dados válidos)
-    const validLeads = leads.filter(l => l.nome_empresa || l.telefone || l.email);
-    if (validLeads.length > 0) {
-      await sendWebhook(validLeads);
+    // Webhook (only if we have real data)
+    const valid = leads.filter(l => l.nome_empresa || l.telefone || l.email);
+    if (valid.length > 0) {
+      await sendWebhook(valid);
+    } else if (leads.length > 0) {
+      log.warn("Leads sem dados válidos — webhook NÃO enviado.");
     } else {
-      log.warn("Nenhum lead válido para enviar (todos sem empresa/telefone/email).");
-      log.warn("Isso pode indicar que o login ou navegação falhou silenciosamente.");
+      log.warn("ZERO leads — webhook NÃO enviado.");
     }
-
-    // Warnings
-    const noEmpresa = leads.filter(l => !l.nome_empresa).length;
-    if (noEmpresa > 0) log.warn(`${noEmpresa} leads sem empresa`);
-    if (leads.length === 0) log.warn("ZERO leads extraídos!");
 
     await browser.close();
-    return { success: leads.length > 0, total: leads.length, method: exportResult.method };
+    return { ok: true, n: leads.length, method: result.method };
   } catch (err) {
-    log.error(`ERRO: ${err.message}`);
+    log.err(err.message);
     if (browser) {
       try {
-        const pg = browser.contexts()[0]?.pages()[0];
-        if (pg) {
-          const errPath = path.join(CONFIG.outputDir, `error_${getTimestamp()}.png`);
-          await pg.screenshot({ path: errPath, fullPage: true });
-          log.info(`Screenshot erro: ${errPath}`);
+        const p = browser.contexts()[0]?.pages()[0];
+        if (p) {
+          await p.screenshot({ path: path.join(CONFIG.outputDir, `error_${stamp()}.png`), fullPage: true });
         }
-      } catch (_) {}
+      } catch {}
       await browser.close();
     }
     throw err;
   }
 }
 
-async function scrapeWithRetry() {
+async function run() {
   for (let i = 1; i <= CONFIG.retryAttempts; i++) {
-    log.info(`══ Tentativa ${i}/${CONFIG.retryAttempts} ══`);
-    try {
-      return await scrape();
-    } catch (err) {
-      log.error(`Tentativa ${i} falhou: ${err.message}`);
+    log.info(`═══ Tentativa ${i}/${CONFIG.retryAttempts} ═══`);
+    try { return await scrape(); }
+    catch (e) {
+      log.err(`Tentativa ${i}: ${e.message}`);
       if (i < CONFIG.retryAttempts) {
-        log.info(`Aguardando ${CONFIG.retryDelayMs / 1000}s...`);
+        // Delete saved session on failure (might be stale)
+        try { fs.unlinkSync(CONFIG.storagePath); } catch {}
         await sleep(CONFIG.retryDelayMs);
       }
     }
   }
-  return { success: false, total: 0, method: "none" };
+  return { ok: false, n: 0, method: "none" };
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Cron loop
-// ═══════════════════════════════════════════════════════════════════════════════
 async function main() {
-  log.info("╔══════════════════════════════════════════════════════╗");
-  log.info("║  Brokers Lead Exporter v3 — V4 Ferraz Piai & Co.   ║");
-  log.info("╚══════════════════════════════════════════════════════╝");
-  log.info(`Intervalo: ${CONFIG.cronIntervalMs / 60000} min`);
-  log.info(`Workspace URL: ${CONFIG.workspaceUrl}`);
-  log.info(`Webhook: ${CONFIG.webhookUrl ? "OK" : "NÃO CONFIGURADO"}`);
-  log.info(`Debug: ${CONFIG.debug}`);
+  log.info("╔═════════════════════════════════════════════════╗");
+  log.info("║  Brokers Lead Exporter v4 — V4 Ferraz Piai     ║");
+  log.info("╚═════════════════════════════════════════════════╝");
+  log.info(`Loop: ${CONFIG.cronIntervalMs / 60000}min | Debug: ${CONFIG.debug}`);
+  log.info(`Webhook: ${CONFIG.webhookUrl ? "OK" : "NÃO"}`);
   log.info("");
 
-  const r = await scrapeWithRetry();
-  log.info(`→ ${r.success ? "SUCESSO" : "FALHA"} — ${r.total} leads (${r.method})`);
-  log.info(`Próxima execução em ${CONFIG.cronIntervalMs / 60000} min...\n`);
+  const r = await run();
+  log.info(`→ ${r.ok ? "OK" : "FALHA"} — ${r.n} leads (${r.method})`);
+  log.info(`Próxima em ${CONFIG.cronIntervalMs / 60000}min\n`);
 
   setInterval(async () => {
-    log.info("═══════════════════════════════════════════════════════");
-    const r = await scrapeWithRetry();
-    log.info(`→ ${r.success ? "SUCESSO" : "FALHA"} — ${r.total} leads (${r.method})`);
-    log.info(`Próxima em ${CONFIG.cronIntervalMs / 60000} min...\n`);
+    log.info("═══════════════════════════════════════════════════");
+    const r = await run();
+    log.info(`→ ${r.ok ? "OK" : "FALHA"} — ${r.n} leads (${r.method})`);
+    log.info(`Próxima em ${CONFIG.cronIntervalMs / 60000}min\n`);
   }, CONFIG.cronIntervalMs);
 }
 
